@@ -92,6 +92,8 @@ namespace
         uintptr_t unlock_map_find, unlock_map_alloc, fname_hash, unlock_map_link;
         // event highway and the Diamond Store
         uintptr_t new_highway_event, ec_list_done, ec_purchase_done, claimed_done, ec_purchase_request;
+        // shared mixes
+        uintptr_t playback_load;
     };
     constexpr VerifiedBuild kVerified[] = {
         {.name = STR("EGS v1.4.2"),
@@ -104,7 +106,8 @@ namespace
             .pak_mount = 0x17c5330, .cel_mgr_of = 0x5915c0, .cel_mgr_register = 0x59c740,
             .unlock_map_find = 0x4640e0, .unlock_map_alloc = 0x341bf0, .fname_hash = 0x9eab10,
             .unlock_map_link = 0x358bc0, .new_highway_event = 0x771540, .ec_list_done = 0x790530,
-            .ec_purchase_done = 0x791730, .claimed_done = 0x7901c0, .ec_purchase_request = 0x789280},
+            .ec_purchase_done = 0x791730, .claimed_done = 0x7901c0, .ec_purchase_request = 0x789280,
+            .playback_load = 0x658a70},
         // derived by tools/derive_mp_build.py (2026-10-04): every address CONFIRMED, every body the same
         {.name = STR("EGS CL1317808"),
             .drop_song_item_play = 0x7b3500, .drop_desk_spawn_disc = 0x5fdbd0,
@@ -116,7 +119,8 @@ namespace
             .pak_mount = 0x17c5360, .cel_mgr_of = 0x5915c0, .cel_mgr_register = 0x59c740,
             .unlock_map_find = 0x4640e0, .unlock_map_alloc = 0x341bf0, .fname_hash = 0x9eab40,
             .unlock_map_link = 0x358bc0, .new_highway_event = 0x771570, .ec_list_done = 0x790560,
-            .ec_purchase_done = 0x791760, .claimed_done = 0x7901f0, .ec_purchase_request = 0x7892b0},
+            .ec_purchase_done = 0x791760, .claimed_done = 0x7901f0, .ec_purchase_request = 0x7892b0,
+            .playback_load = 0x658a70},
         {.name = STR("Steam CL1317755"),
             .drop_song_item_play = 0x7e8ec0, .drop_desk_spawn_disc = 0x6347d0,
             .drop_local_disc_spawn = 0x646a90, .drop_send_spawn_disc = 0x6c0c40, .deck_disc_of = 0x664380,
@@ -127,7 +131,8 @@ namespace
             .pak_mount = 0x17f9e40, .cel_mgr_of = 0x5c8bf0, .cel_mgr_register = 0x5d3d70,
             .unlock_map_find = 0x464660, .unlock_map_alloc = 0x341fc0, .fname_hash = 0xa20020,
             .unlock_map_link = 0x358f90, .new_highway_event = 0x7a6ef0, .ec_list_done = 0x7c5ef0,
-            .ec_purchase_done = 0x7c70f0, .claimed_done = 0x7c5b80, .ec_purchase_request = 0x7bec40},
+            .ec_purchase_done = 0x7c70f0, .claimed_done = 0x7c5b80, .ec_purchase_request = 0x7bec40,
+            .playback_load = 0x68e900},
     };
     // every member after the name is a uintptr_t: complete() walks them as an array
     constexpr size_t kAddrCount = (sizeof(VerifiedBuild) - offsetof(VerifiedBuild, drop_song_item_play)) / sizeof(uintptr_t);
@@ -2115,6 +2120,23 @@ namespace
         return mode == kDownloadNo ? STR("No") : mode == kDownloadTemporarily ? STR("Temporarily") : STR("Permanently");
     }
 
+    // Download Mix Songs (the same three choices, DownloadMixSongs=0/1/2, default Temporarily): the custom songs of a
+    // shared mix, fetched before the game downloads the mix. Watching someone's mix isn't wanting their songs in the
+    // library, hence its own setting. Read like DownloadSongs.
+    auto mix_download_mode() -> int
+    {
+        static std::mutex mu;
+        static uint64 read_at = 0;
+        static int mode = kDownloadTemporarily;
+        std::lock_guard lock(mu);
+        const uint64 now = GetTickCount64();
+        if (read_at && now - read_at < 1000) return mode;
+        read_at = now;
+        const int parsed = _wtoi(ini_value(STR("DownloadMixSongs"), STR("1")).c_str());
+        mode = parsed >= kDownloadNo && parsed <= kDownloadPermanently ? parsed : kDownloadTemporarily;
+        return mode;
+    }
+
     // Temporarily: %LOCALAPPDATA%\Fuser\Saved\FuserNative\SessionSongs\<pid>\, outside Content/Paks so the next
     // launch doesn't mount it. The pak keeps its <sn>_P.pak name and its .sig beside it: the signature bypass
     // (dllmain.cpp) keys on "_P" in the file name, not on the folder. Per process, because two games can run from one
@@ -2519,26 +2541,27 @@ namespace
                std::ranges::any_of(g_song_installs, [](const auto& j) { return j->stage != SongInstall::Stage::Done && j->stage != SongInstall::Stage::Failed; });
     }
 
-    // follow_setting: the fetch is Download Songs' to allow (No refuses it) and place (Temporarily or Permanently); a
-    // Diamond Store purchase passes false and always installs permanently.
-    auto request_song_install(const StringType& shortname, bool by_path = false, bool follow_setting = true) -> void
+    // mode: where the song goes (kDownloadTemporarily or kDownloadPermanently; kDownloadNo refuses the fetch). The
+    // default follows Download Songs; a Diamond Store purchase passes kDownloadPermanently, a mix's song Download
+    // Mix Songs. Returns the job, or null when nothing was started.
+    auto request_song_install(const StringType& shortname, bool by_path = false, int mode = -1) -> std::shared_ptr<SongInstall>
     {
         if (shortname.empty())
         {
             Output::send<LogLevel::Warning>(STR("[store] no song to install: set StoreTestInstall=<shortname> in FuserNative.ini\n"));
-            return;
+            return nullptr;
         }
-        const int mode = follow_setting ? download_mode() : kDownloadPermanently;
+        if (mode < 0) mode = download_mode();
         if (mode == kDownloadNo)
         {
-            Output::send<LogLevel::Normal>(STR("[store] {}: not fetched (Download Songs is No)\n"), shortname);
-            return;
+            Output::send<LogLevel::Normal>(STR("[store] {}: not fetched (its download setting is No)\n"), shortname);
+            return nullptr;
         }
         const StringType base = store_api_base();
         if (base.empty())
         {
             Output::send<LogLevel::Error>(STR("[store] no fuserd URL: set StoreURL= or the Live ClientURL\n"));
-            return;
+            return nullptr;
         }
         const StringType token = backend_token();
         const size_t dots = std::count(token.begin(), token.end(), L'.');
@@ -2555,6 +2578,7 @@ namespace
             g_song_installs.push_back(job);
         }
         std::thread(song_fetch, job, base, token).detach();
+        return job;
     }
 
     // The crate scan's missing songs (crate Meta object paths), resolved in one batch (song_fetch_batch).
@@ -4854,7 +4878,7 @@ namespace
             return;
         }
         Output::send<LogLevel::Normal>(STR("[store] {}: {}, not installed here: installing\n"), sn, why);
-        request_song_install(sn, false, follow_setting);
+        request_song_install(sn, false, follow_setting ? -1 : kDownloadPermanently);
     }
 
     // A tile's catalogue details, fetched once per shortname (api/community/resolve/).
@@ -5284,6 +5308,8 @@ namespace
                                        shown ? STR("shown; text replaced") : STR("queued; text replaced"), o.limit, o.songs);
     }
 
+    auto log_added_popup(UObject* mgr) -> void; // shared mixes, below
+
     // Every engine tick: the fetch (at startup, retried every 30 s until fuserd answers, and again whenever the online
     // flow starts, at most once a minute), the hooks, and lifting the limit the tick after the check.
     auto drive_crate_limit() -> void
@@ -5314,10 +5340,12 @@ namespace
         UObjectGlobals::RegisterHook(
             queue,
             [](UnrealScriptFunctionCallableContext& ctx, void*) {
-                if (g_crate_override.active && !g_crate_override.popup_done) g_popup_before = popup_state(ctx.Context);
+                if (GetCurrentThreadId() == g_game_thread) g_popup_before = popup_state(ctx.Context);
             },
             [](UnrealScriptFunctionCallableContext& ctx, void*) {
-                if (g_crate_override.active && !g_crate_override.popup_done && ctx.Context && GetCurrentThreadId() == g_game_thread) crate_limit_popup(ctx.Context);
+                if (!ctx.Context || GetCurrentThreadId() != g_game_thread) return;
+                if (g_crate_override.active && !g_crate_override.popup_done) crate_limit_popup(ctx.Context);
+                log_added_popup(ctx.Context);
             },
             nullptr);
         static const FName state_changed(STR("OnOnlineModeFlowStateChanged_Event"), FNAME_Add);
@@ -5338,6 +5366,533 @@ namespace
         Output::send<LogLevel::Verbose>(STR("[crate] crate song limit hooks installed (online flow state, PopupManager.QueuePopup)\n"));
     }
 
+    // ---- Shared mixes: their custom songs, before a mix plays -------------------------------------------------------
+    // A shared mix plays in a venue whose playback flow component (UPlaybackFlowMgr) hands the mix data to the recorder
+    // in FUN_140658a70 (this, const FRecordingMetadata*): the data, if the RecordingDB has it cached, goes to the
+    // recorder (its virtual +0x3f0), and the metadata becomes _curRecording. Two callers: the flow's start (FUN_140642b10,
+    // UPlaybackFlowMgr's override of the virtual URecordFlowMgr implements with FUN_140642c40) and
+    // UpdateRecordingMetadata (FUN_1406543d0, Blueprint-callable, with a temporary copy of the metadata). The data
+    // itself is downloaded elsewhere (URecordingDB::FetchRecordingForSubmission), by the screen that opened the mix or
+    // by the recorder UI, and so is mix data that is never played: the playback-complete screen's next mixes, the mix
+    // browser's previews. So the hold is on that load, not on the fetch. The first load of a recording by a flow
+    // component is held, with a copy of its metadata; the release loads that copy. A load of the same recording while
+    // it is held is dropped, and one after the release goes ahead (the recording was checked). A load of another
+    // recording ends the hold without loading it and is held in its turn. FRecordingMetadata starts with submissionID.
+    //
+    // A custom song the mix uses and this machine lacks can't play, and the game's recording answers carry no song
+    // list. So the hold asks fuserd (community/recording_songs/), fetches the missing songs through Route B (placed as
+    // Download Mix Songs says) and starts the playback once each has ended, or after kMixHoldMaxMs. A song fuserd names
+    // without a source (listed by the mix, but in neither its catalogue nor its community table) isn't fetched: it is
+    // reported as missing at once. Every playback asks again, so a fetch that failed is tried again by the next one.
+    //
+    // The player sees the count in a WBP_HypePopup_Status (FUSER's loading dots, no buttons), titled kMixPopupTitle;
+    // the game uses the same popup class with its own title while the recorder UI waits for the mix data.
+    // PopupManager.QueuePopup (FUN_140794710) shows a popup only while the shell isn't changing screens and its top
+    // screen isn't Loading or None; otherwise it queues it. So while the popup waits in the queue and a loading screen
+    // is on show, the count goes in the loading screen's TipText too. Songs that couldn't be fetched are named
+    // afterwards in a WBP_HypePopup_TextOnly with an OK button. An OK button needs a bound onResponseAccept
+    // (UHypePopup::HasAcceptButton, FUN_140845d70); the delegate's target is the player controller's ForceNetUpdate,
+    // which has no parameters and no effect here. The popup's own accept event closes it (ClosesOnAccept).
+    using PlaybackLoadFn = void (*)(void*, const uint8*);
+    PlaybackLoadFn g_playback_load_original = nullptr;
+    constexpr uint64 kMixAskMaxMs = 20000;   // fuserd's song list
+    constexpr uint64 kMixHoldMaxMs = 120000; // the whole hold
+    constexpr const CharType* kStatusPopupClass = STR("/Game/UI/Shared/Popup/WBP_HypePopup_Status.WBP_HypePopup_Status_C");
+    constexpr const CharType* kTextPopupClass = STR("/Game/UI/Shared/Popup/WBP_HypePopup_TextOnly.WBP_HypePopup_TextOnly_C");
+    constexpr const CharType* kMixPopupTitle = STR("Custom Songs");
+    constexpr uint8 kPopupMedium = 1; // EPopupSize
+
+    struct MixSong
+    {
+        StringType sn, title, artist;
+        bool sourced = true; // fuserd has a source for it (its catalogue or community table)
+        std::shared_ptr<SongInstall> job{};
+    };
+    struct MixAnswer // fuserd's song list, from the worker (g_mix_mu)
+    {
+        bool done = false;
+        std::vector<MixSong> songs{};
+        StringType error{};
+    };
+    std::mutex g_mix_mu;
+    // FRecordingMetadata, through UPlaybackFlowMgr.UpdateRecordingMetadata's parameter.
+    auto metadata_property() -> FStructProperty*
+    {
+        static FStructProperty* p = [] {
+            auto* fn = UObjectGlobals::StaticFindObject<UFunction*>(nullptr, nullptr, STR("/Script/Hype.PlaybackFlowMgr:UpdateRecordingMetadata"));
+            return fn ? CastField<FStructProperty>(fn->FindProperty(FName(STR("RecordingMetadata"), FNAME_Add))) : nullptr;
+        }();
+        return p;
+    }
+    struct MetadataFree
+    {
+        auto operator()(uint8* p) const -> void
+        {
+            metadata_property()->DestroyValue(p);
+            _aligned_free(p);
+        }
+    };
+    using MetadataCopy = std::unique_ptr<uint8, MetadataFree>;
+    auto copy_metadata(const uint8* metadata) -> MetadataCopy
+    {
+        FStructProperty* p = metadata_property();
+        if (!p) return {};
+        auto* copy = static_cast<uint8*>(_aligned_malloc(static_cast<size_t>(p->GetElementSize()), 16));
+        if (!copy) return {};
+        p->InitializeValue(copy);
+        p->CopyCompleteValue(copy, metadata);
+        return MetadataCopy(copy);
+    }
+
+    struct MixHold // one playback (game thread)
+    {
+        FWeakObjectPtr flow{};             // its UPlaybackFlowMgr
+        MetadataCopy metadata{};           // the FRecordingMetadata loaded at the release
+        int32 id = 0;                      // its submissionID
+        StringType name{};
+        uint64 started = 0;
+        int mode = kDownloadTemporarily;
+        std::shared_ptr<MixAnswer> answer{};
+        bool listed = false;                // the answer has been acted on
+        std::vector<MixSong> missing{};     // fetched for this playback
+        std::vector<MixSong> unavailable{}; // missing, with no source on fuserd: not fetched
+        StringType status{};                // the text last shown
+    };
+    std::vector<MixHold> g_mix_holds{};
+    // The recording each flow component was last held for: its later loads of that recording go ahead.
+    struct MixLoaded
+    {
+        FWeakObjectPtr flow{};
+        int32 id = 0;
+    };
+    std::vector<MixLoaded> g_mix_loaded{};
+    // The loading screen's TipText while it shows a hold's count, to put back afterwards.
+    struct TipOverride
+    {
+        FWeakObjectPtr text{};
+        StringType old_text{};
+        uint8 old_visibility = 0;
+    };
+    TipOverride g_tip{};
+
+    // Worker thread: fuserd's custom songs for the recording.
+    auto mix_songs_fetch(int32 id, std::shared_ptr<MixAnswer> out, StringType base, StringType token) -> void
+    {
+        StringType headers = L"Content-Type: application/json\r\n";
+        if (!token.empty()) headers += L"Authorization: JWT " + token + L"\r\n";
+        const HttpResult res = http_request(L"POST", base + L"community/recording_songs/", headers, std::format("{{\"recording_id\":{}}}", id), nullptr);
+        jsonl::Value root;
+        std::vector<MixSong> songs{};
+        StringType error{};
+        if (!res.error.empty() || res.status != 200 || !jsonl::parse(res.body, &root))
+            error = std::format(STR("HTTP {} {}{}"), res.status, widen(res.error), widen(res.body.substr(0, 160)));
+        else
+        {
+            const jsonl::Value& list = root["results"]["songs"];
+            for (size_t i = 0; i < list.size(); ++i)
+            {
+                const jsonl::Value& s = list.at(i);
+                const std::string sn = s["short_name"].str();
+                if (!sn.empty() && sn.find_first_of("/\\.:\"") == std::string::npos)
+                    songs.push_back(MixSong{widen(sn), widen(s["title"].str()), widen(s["artist"].str()), !s["source"].str().empty()});
+            }
+        }
+        std::lock_guard lock(g_mix_mu);
+        out->songs = std::move(songs);
+        out->error = std::move(error);
+        out->done = true;
+    }
+
+    auto popup_manager() -> UObject*
+    {
+        Call c(STR("/Script/Hype.PopupManager:GetPopupManager"));
+        c.set<UObject*>(STR("contextObj"), game_instance());
+        return c.call(cdo(STR("/Script/Hype.Default__PopupManager"))) ? c.get<UObject*>(STR("ReturnValue")) : nullptr;
+    }
+
+    auto set_struct_text(FProperty* st, uint8* data, const CharType* field, const StringType& text) -> void
+    {
+        if (FProperty* f = struct_member(st, field))
+        {
+            const FText value(text.c_str());
+            f->CopyCompleteValue(f->ContainerPtrToValuePtr<void>(data), &value);
+        }
+    }
+    auto struct_text(FProperty* st, uint8* data, const CharType* field) -> StringType
+    {
+        FProperty* f = struct_member(st, field);
+        if (!f) return {};
+        FText value{};
+        f->CopyCompleteValue(&value, f->ContainerPtrToValuePtr<void>(data));
+        return value.ToString();
+    }
+
+    // After any PopupManager.QueuePopup (the hook in drive_crate_limit): the popup it added - shown at once, or the last
+    // in the queue - by class and title. The game's own popups look like ours (the same classes), so the log tells them
+    // apart.
+    auto log_added_popup(UObject* mgr) -> void
+    {
+        const PopupState now = popup_state(mgr);
+        FProperty* pd = nullptr;
+        uint8* data = nullptr;
+        const CharType* how = STR("");
+        if (now.open && now.open != g_popup_before.open)
+        {
+            pd = now.open->GetPropertyByNameInChain(STR("PopupData"));
+            data = pd ? pd->ContainerPtrToValuePtr<uint8>(now.open) : nullptr;
+            how = STR("shown");
+        }
+        else if (now.queued > g_popup_before.queued && now.queued > 0)
+        {
+            auto* queue = CastField<FArrayProperty>(mgr->GetPropertyByNameInChain(STR("_queuedPopups")));
+            pd = queue ? queue->GetInner() : nullptr;
+            auto* arr = queue ? queue->ContainerPtrToValuePtr<TArray<uint8>>(mgr) : nullptr;
+            data = pd && arr ? arr->Data + static_cast<size_t>(now.queued - 1) * static_cast<size_t>(pd->GetElementSize()) : nullptr;
+            how = STR("queued");
+        }
+        FProperty* widget = struct_member(pd, STR("PopupWidget"));
+        if (!data || !widget) return;
+        UObject* cls = *widget->ContainerPtrToValuePtr<UObject*>(data);
+        Output::send<LogLevel::Normal>(STR("[popup] {} {}: '{}' - '{}'\n"), how, cls ? cls->GetName() : StringType(STR("?")),
+                                       struct_text(pd, data, STR("TitleText")), struct_text(pd, data, STR("DescriptionText")).substr(0, 120));
+    }
+
+    // PopupManager.QueuePopup with one of the stock popups, titled kMixPopupTitle.
+    auto queue_popup(const CharType* class_path, const StringType& text, bool ok_button) -> bool
+    {
+        UObject* mgr = popup_manager();
+        UObject* cls = load_asset(class_path);
+        Call c(STR("/Script/Hype.PopupManager:QueuePopup"));
+        FProperty* pd = c.param(STR("PopupData"));
+        auto* data = static_cast<uint8*>(c.raw(STR("PopupData")));
+        if (!mgr || !cls || !pd || !data) return false;
+        if (FProperty* w = struct_member(pd, STR("PopupWidget"))) *w->ContainerPtrToValuePtr<UObject*>(data) = cls;
+        if (FProperty* size = struct_member(pd, STR("PopupSize"))) *size->ContainerPtrToValuePtr<uint8>(data) = kPopupMedium;
+        set_struct_text(pd, data, STR("TitleText"), kMixPopupTitle);
+        set_struct_text(pd, data, STR("DescriptionText"), text);
+        if (ok_button)
+        {
+            Call pc(STR("/Script/Engine.GameplayStatics:GetPlayerController"));
+            pc.set<UObject*>(STR("WorldContextObject"), game_instance()).set<int32>(STR("PlayerIndex"), 0);
+            UObject* controller = pc.call(cdo(STR("/Script/Engine.Default__GameplayStatics"))) ? pc.get<UObject*>(STR("ReturnValue")) : nullptr;
+            auto* accept = static_cast<uint8*>(c.raw(STR("onResponseAccept"))); // FScriptDelegate {FWeakObjectPtr, FName}
+            if (!controller || !accept) return false;
+            const FWeakObjectPtr target(controller);
+            const FName function(STR("ForceNetUpdate"), FNAME_Add);
+            std::memcpy(accept, &target, sizeof(target));
+            std::memcpy(accept + sizeof(target), &function, sizeof(function));
+            set_struct_text(pd, data, STR("AcceptPromptText"), STR("OK"));
+            if (auto* closes = CastField<FBoolProperty>(struct_member(pd, STR("ClosesOnAccept"))))
+                closes->SetPropertyValue(closes->ContainerPtrToValuePtr<void>(data), true);
+        }
+        return c.call(mgr);
+    }
+
+    // Our status popup: the open one, or its entry still waiting in the queue.
+    struct StatusPopup
+    {
+        UObject* open = nullptr;
+        FProperty* pd = nullptr; // FPopupData property (the popup's, or the queue's inner)
+        uint8* data = nullptr;
+        int32 queued = -1;
+    };
+    auto find_status_popup(UObject* mgr) -> StatusPopup
+    {
+        UObject* cls = load_asset(kStatusPopupClass);
+        if (!mgr || !cls) return {};
+        auto ours = [&](FProperty* pd, uint8* data) {
+            FProperty* w = struct_member(pd, STR("PopupWidget"));
+            return w && *w->ContainerPtrToValuePtr<UObject*>(data) == cls && struct_text(pd, data, STR("TitleText")) == kMixPopupTitle;
+        };
+        if (UObject* open = prop<UObject*>(mgr, STR("_openPopup")))
+        {
+            FProperty* pd = open->GetPropertyByNameInChain(STR("PopupData"));
+            uint8* data = pd ? pd->ContainerPtrToValuePtr<uint8>(open) : nullptr;
+            if (data && ours(pd, data)) return {open, pd, data, -1};
+        }
+        auto* queue = CastField<FArrayProperty>(mgr->GetPropertyByNameInChain(STR("_queuedPopups")));
+        FProperty* inner = queue ? queue->GetInner() : nullptr;
+        auto* arr = queue ? queue->ContainerPtrToValuePtr<TArray<uint8>>(mgr) : nullptr;
+        for (int32 i = 0; inner && arr && i < arr->Num(); ++i)
+        {
+            uint8* data = arr->Data + static_cast<size_t>(i) * static_cast<size_t>(inner->GetElementSize());
+            if (ours(inner, data)) return {nullptr, inner, data, i};
+        }
+        return {};
+    }
+
+    // The loading screen on show and its TipText, for a count the queued popup can't show yet.
+    auto loading_tip() -> UObject*
+    {
+        for (UObject* s : live_objects(STR("WBP_Screen_Loading_C")))
+            if (widget_visible(s))
+                if (UObject* tip = find_widget(prop<UObject*>(prop<UObject*>(s, STR("WidgetTree")), STR("RootWidget")), STR("TipText"))) return tip;
+        return nullptr;
+    }
+    auto widget_text(UObject* w) -> StringType
+    {
+        UFunction* fn = w ? w->GetFunctionByNameInChain(STR("GetText")) : nullptr;
+        if (!fn) return {};
+        Call c(fn);
+        FText value{};
+        if (FProperty* ret = c.param(STR("ReturnValue")); ret && c.call(w)) ret->CopyCompleteValue(&value, c.raw(STR("ReturnValue")));
+        return value.ToString();
+    }
+    auto set_visibility(UObject* w, uint8 visibility) -> void
+    {
+        Call c(STR("/Script/UMG.Widget:SetVisibility"));
+        c.set<uint8>(STR("InVisibility"), visibility).call(w);
+    }
+    auto show_tip(const StringType& text) -> void
+    {
+        UObject* tip = g_tip.text.Get();
+        if (!tip)
+        {
+            tip = loading_tip();
+            if (!tip) return;
+            Call vis(STR("/Script/UMG.Widget:GetVisibility"));
+            g_tip = TipOverride{FWeakObjectPtr(tip), widget_text(tip), vis.call(tip) ? vis.get<uint8>(STR("ReturnValue")) : uint8{0}};
+            Output::send<LogLevel::Normal>(STR("[mix] the popup waits behind the loading screen; the count goes in its {} ({}) too\n"), tip->GetName(),
+                                           tip->GetClassPrivate()->GetName());
+        }
+        call_with_text(tip, STR("SetText"), text);
+        set_visibility(tip, kHitTestInvisible);
+    }
+    auto restore_tip() -> void
+    {
+        if (UObject* tip = g_tip.text.Get())
+        {
+            call_with_text(tip, STR("SetText"), g_tip.old_text.empty() ? StringType(STR(" ")) : g_tip.old_text);
+            set_visibility(tip, g_tip.old_visibility);
+        }
+        g_tip = TipOverride{};
+    }
+
+    // The status text: in the popup (open: RefreshValues; queued: when it opens), and behind a loading screen.
+    auto show_status(MixHold& h, const StringType& text) -> void
+    {
+        if (text == h.status) return;
+        h.status = text;
+        const StatusPopup p = find_status_popup(popup_manager());
+        if (p.data) set_struct_text(p.pd, p.data, STR("DescriptionText"), text);
+        if (p.open)
+            if (UFunction* refresh = p.open->GetFunctionByNameInChain(STR("RefreshValues")))
+            {
+                Call c(refresh);
+                c.call(p.open);
+            }
+        if (p.queued >= 0) show_tip(text);
+        else restore_tip();
+    }
+
+    auto close_status_popup() -> void
+    {
+        restore_tip();
+        UObject* mgr = popup_manager();
+        const StatusPopup p = find_status_popup(mgr);
+        if (p.open)
+        {
+            Call c(STR("/Script/Hype.PopupManager:ClosePopup"));
+            c.set<UObject*>(STR("popup"), p.open).set<bool>(STR("loadNextPopup"), true).call(mgr);
+            Output::send<LogLevel::Normal>(STR("[mix] status popup closed\n"));
+        }
+        else if (p.queued >= 0)
+        {
+            auto* arr = CastField<FArrayProperty>(mgr->GetPropertyByNameInChain(STR("_queuedPopups")))->ContainerPtrToValuePtr<TArray<uint8>>(mgr);
+            const size_t size = static_cast<size_t>(p.pd->GetElementSize());
+            p.pd->DestroyValue(p.data);
+            std::memmove(p.data, p.data + size, static_cast<size_t>(arr->Num() - p.queued - 1) * size);
+            --arr->ArrayNum;
+            Output::send<LogLevel::Normal>(STR("[mix] status popup was still waiting in the queue; withdrawn\n"));
+        }
+    }
+
+    auto mix_song_label(const MixSong& s) -> StringType
+    {
+        if (s.title.empty()) return s.sn;
+        return s.artist.empty() ? s.title : std::format(STR("{} - {}"), s.title, s.artist);
+    }
+
+    // Game thread: load the recording (if its flow component is still there), then the popups.
+    auto mix_release(MixHold& h, const CharType* why) -> void
+    {
+        std::vector<const MixSong*> failed{};
+        for (const MixSong& s : h.missing)
+        {
+            std::lock_guard lock(g_song_mutex);
+            if (!s.job || s.job->stage != SongInstall::Stage::Done || !s.job->error.empty()) failed.push_back(&s);
+        }
+        Output::send<LogLevel::Normal>(STR("[mix] recording {}: {} after {} ms; {} of {} song(s) fetched, {} without a source on fuserd\n"), h.id, why,
+                                       GetTickCount64() - h.started, h.missing.size() - failed.size(), h.missing.size(), h.unavailable.size());
+        for (const MixSong& s : h.unavailable) failed.push_back(&s);
+        if (!h.missing.empty()) close_status_popup();
+        UObject* flow = h.flow.Get();
+        if (!flow)
+        {
+            Output::send<LogLevel::Warning>(STR("[mix] recording {}: its playback is gone (the playback flow component was destroyed); not loaded\n"), h.id);
+            return;
+        }
+        Output::send<LogLevel::Normal>(STR("[mix] recording {}: playback starts\n"), h.id);
+        g_playback_load_original(flow, h.metadata.get());
+        if (failed.empty()) return;
+        StringType text = failed.size() == 1 ? StringType(STR("A custom song in this mix couldn't be downloaded, so it will be silent:"))
+                                             : std::format(STR("{} custom songs in this mix couldn't be downloaded, so they will be silent:"), failed.size());
+        for (size_t i = 0; i < failed.size() && i < 8; ++i) text += STR("\n") + mix_song_label(*failed[i]);
+        if (failed.size() > 8) text += std::format(STR("\nand {} more"), failed.size() - 8);
+        const bool queued = queue_popup(kTextPopupClass, text, true);
+        Output::send<LogLevel::Normal>(STR("[mix] recording {}: {} song(s) missing; popup {}\n"), h.id, failed.size(), queued ? STR("queued") : STR("NOT queued"));
+    }
+
+    auto mix_status_text(const MixHold& h, size_t ended) -> StringType
+    {
+        const size_t n = h.missing.size();
+        return std::format(STR("This mix uses {} you don't have. Downloading {} before it plays: {} of {} done."),
+                           n == 1 ? StringType(STR("a custom song")) : std::format(STR("{} custom songs"), n), n == 1 ? STR("it") : STR("them"), ended, n);
+    }
+
+    // The hook: hold the load while fuserd is asked (true), or let it go ahead (false).
+    auto mix_hold_load(void* flow, const uint8* metadata) -> bool
+    {
+        int32 id = 0;
+        if (!flow || !metadata || !read_i32(metadata, 0, &id) || id <= 0) return false;
+        if (auto held = std::ranges::find_if(g_mix_holds, [flow](const MixHold& h) { return h.flow.Get() == flow; }); held != g_mix_holds.end())
+        {
+            if (held->id == id)
+            {
+                Output::send<LogLevel::Normal>(STR("[mix] recording {}: loaded again while held; dropped\n"), id);
+                return true;
+            }
+            Output::send<LogLevel::Normal>(STR("[mix] recording {}: the playback moved on to recording {}; the hold ends without loading it\n"), held->id, id);
+            if (!held->missing.empty()) close_status_popup();
+            g_mix_holds.erase(held);
+        }
+        std::erase_if(g_mix_loaded, [](const MixLoaded& l) { return !l.flow.Get(); });
+        auto loaded = std::ranges::find_if(g_mix_loaded, [flow](const MixLoaded& l) { return l.flow.Get() == flow; });
+        if (loaded != g_mix_loaded.end() && loaded->id == id) return false;
+        if (loaded == g_mix_loaded.end()) loaded = g_mix_loaded.insert(g_mix_loaded.end(), MixLoaded{FWeakObjectPtr(static_cast<UObject*>(flow)), id});
+        else loaded->id = id;
+        const int mode = mix_download_mode();
+        const StringType base = store_api_base();
+        if (mode == kDownloadNo || base.empty())
+        {
+            Output::send<LogLevel::Normal>(STR("[mix] recording {}: not checked for custom songs ({})\n"), id,
+                                           mode == kDownloadNo ? STR("Download Mix Songs is No") : STR("no fuserd URL"));
+            return false;
+        }
+        MixHold h{};
+        h.metadata = copy_metadata(metadata);
+        if (!h.metadata)
+        {
+            Output::send<LogLevel::Warning>(STR("[mix] recording {}: not checked for custom songs (FRecordingMetadata not found)\n"), id);
+            return false;
+        }
+        h.flow = FWeakObjectPtr(static_cast<UObject*>(flow));
+        h.id = id;
+        h.started = GetTickCount64();
+        h.mode = mode;
+        h.answer = std::make_shared<MixAnswer>();
+        if (FProperty* name = metadata_property()->GetStruct().Get()->FindProperty(FName(STR("MixName"), FNAME_Add)))
+            h.name = **name->ContainerPtrToValuePtr<FString>(metadata);
+        std::thread(mix_songs_fetch, id, h.answer, base, backend_token()).detach();
+        Output::send<LogLevel::Normal>(STR("[mix] recording {} ('{}'): playback held by {}; asking fuserd for its custom songs (Download Mix Songs {})\n"), id,
+                                       h.name, static_cast<UObject*>(flow)->GetName(), download_mode_name(mode));
+        g_mix_holds.push_back(std::move(h));
+        return true;
+    }
+
+    auto playback_load_detour(void* flow, const uint8* metadata) -> void
+    {
+        if (GetCurrentThreadId() == g_game_thread && mix_hold_load(flow, metadata)) return;
+        g_playback_load_original(flow, metadata);
+    }
+
+    // Game thread: act on fuserd's answer, follow the fetches, release the playback.
+    auto drive_mix_holds() -> void
+    {
+        static uint64 last = 0;
+        const uint64 now = GetTickCount64();
+        if (g_mix_holds.empty() || now - last < 250) return;
+        last = now;
+        for (size_t i = 0; i < g_mix_holds.size();)
+        {
+            MixHold& h = g_mix_holds[i];
+            bool release = false;
+            const CharType* why = STR("");
+            if (!h.flow.Get())
+                release = true, why = STR("the playback ended");
+            else if (!h.listed)
+            {
+                MixAnswer answer{};
+                {
+                    std::lock_guard lock(g_mix_mu);
+                    answer = *h.answer;
+                }
+                if (!answer.done)
+                {
+                    if (now - h.started > kMixAskMaxMs) release = true, why = STR("fuserd didn't answer");
+                }
+                else if (!answer.error.empty())
+                {
+                    Output::send<LogLevel::Warning>(STR("[mix] recording {}: fuserd's song list failed: {}\n"), h.id, answer.error);
+                    release = true, why = STR("no song list");
+                }
+                else
+                {
+                    h.listed = true;
+                    StringType here{}, unsourced{};
+                    for (MixSong& s : answer.songs)
+                    {
+                        if (song_set_by_name(s.sn))
+                        {
+                            here += (here.empty() ? STR("") : STR(", ")) + s.sn;
+                            continue;
+                        }
+                        if (!s.sourced)
+                        {
+                            unsourced += (unsourced.empty() ? STR("") : STR(", ")) + s.sn;
+                            h.unavailable.push_back(std::move(s));
+                            continue;
+                        }
+                        s.job = request_song_install(s.sn, false, h.mode);
+                        h.missing.push_back(std::move(s));
+                    }
+                    Output::send<LogLevel::Normal>(STR("[mix] recording {}: {} custom song(s); here: [{}]; no source on fuserd: [{}]; fetching {}\n"), h.id,
+                                                   answer.songs.size(), here, unsourced, h.missing.size());
+                    if (h.missing.empty()) release = true, why = STR("nothing to fetch");
+                    else
+                    {
+                        h.status = mix_status_text(h, 0);
+                        const bool queued = queue_popup(kStatusPopupClass, h.status, false);
+                        const StatusPopup p = find_status_popup(popup_manager());
+                        Output::send<LogLevel::Normal>(STR("[mix] status popup {}\n"),
+                                                       !queued ? STR("NOT queued") : p.open ? STR("shown") : p.queued >= 0 ? STR("waiting in the queue") : STR("queued, then not found"));
+                        if (p.queued >= 0) show_tip(h.status);
+                    }
+                }
+            }
+            if (!release && h.listed)
+            {
+                size_t ended = 0;
+                for (const MixSong& s : h.missing)
+                {
+                    std::lock_guard lock(g_song_mutex);
+                    if (!s.job || s.job->stage == SongInstall::Stage::Done) ++ended;
+                }
+                if (ended == h.missing.size()) release = true, why = STR("every song ended");
+                else if (now - h.started > kMixHoldMaxMs) release = true, why = STR("time ran out");
+                else show_status(h, mix_status_text(h, ended));
+            }
+            if (!release)
+            {
+                ++i;
+                continue;
+            }
+            MixHold done = std::move(h);
+            g_mix_holds.erase(g_mix_holds.begin() + static_cast<std::ptrdiff_t>(i));
+            mix_release(done, why);
+        }
+    }
+
     auto install_store_hooks() -> void
     {
         static bool installed = false;
@@ -5354,6 +5909,11 @@ namespace
             const auto [prep, inst] = install_hook(at(&VerifiedBuild::ec_purchase_request), reinterpret_cast<void*>(&ec_purchase_request_detour),
                                                    reinterpret_cast<void**>(&g_ec_purchase_request_original), STR("Diamond Store purchase request"));
             Output::send<LogLevel::Verbose>(STR("[store] Diamond Store purchase request (FUN_140789280) hook - prepare {} install {}\n"), prep, inst);
+        }
+        {
+            const auto [prep, inst] = install_hook(at(&VerifiedBuild::playback_load), reinterpret_cast<void*>(&playback_load_detour),
+                                                   reinterpret_cast<void**>(&g_playback_load_original), STR("shared mix playback load"));
+            Output::send<LogLevel::Verbose>(STR("[mix] shared mix playback load (FUN_140658a70) hook - prepare {} install {}\n"), prep, inst);
         }
     }
 
@@ -5376,6 +5936,7 @@ namespace
         prepare_hook(at(&VerifiedBuild::ec_purchase_done), reinterpret_cast<void*>(&ec_purchase_done_detour));
         prepare_hook(at(&VerifiedBuild::claimed_done), reinterpret_cast<void*>(&claimed_done_detour));
         prepare_hook(at(&VerifiedBuild::ec_purchase_request), reinterpret_cast<void*>(&ec_purchase_request_detour));
+        prepare_hook(at(&VerifiedBuild::playback_load), reinterpret_cast<void*>(&playback_load_detour));
         int prepared = 0, in_range = 0;
         for (const auto& [address, p] : g_prepared_hooks)
         {
@@ -5430,6 +5991,7 @@ auto host_hook_start() -> void
         drive_crate_scan();
         drive_song_installs();
         drive_claimed_installs();
+        drive_mix_holds();      // shared mixes: their custom songs before a mix plays
         drive_song_transfers(); // song transfers between players
         drive_sync_notices();   // custom-song sync notices on the event highway
         drive_store_tiles();

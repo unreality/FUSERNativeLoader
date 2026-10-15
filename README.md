@@ -90,6 +90,12 @@ dedicated server. It handles:
   the limit. The same call, logged in, reports the loader's version and exe build to fuserd (at login and on each
   entry to multiplayer), which keeps stock FUSER players apart from loader users;
 - the Diamond store's installs and tiles;
+- a shared mix's custom songs: when a mix's playback starts, its song list comes from fuserd
+  (`community/recording_songs/`), the songs this machine lacks are fetched like crate songs, and the playback waits
+  for them (at most 2 minutes) behind a "Custom Songs" status popup, with a popup naming any that couldn't be fetched.
+  Mixes the game only previews (the playback-complete screen's next mixes, the mix browser) aren't checked.
+  Download Mix Songs in the game's settings (`DownloadMixSongs`, No / Temporarily / Permanently, default
+  Temporarily) places them;
 - the missing-stem skip (`MissingCelSkip`), so a song this machine lacks doesn't stall a DJ's queue;
 - diagnostics: `DiagnosticLogs=1` (off by default, in every build) logs the clock samples during a set
   (`HostLobbyClockTrace=1` adds lobby samples) and the state / connection watch after a join. The Debug build

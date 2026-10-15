@@ -121,10 +121,11 @@ namespace
     // New-crate slot counts: -1 = never set in our Settings rows, the game's own value stands. Only
     // FuserNative.ini holds them (Game.ini is reset by the game, so it is neither read nor written for this).
     int32 g_new_crate_songs = -1, g_new_crate_moments = -1;
-    // Song delivery: Download Songs (No / Temporarily / Permanently) and Send Songs to
+    // Song delivery: Download Songs and Download Mix Songs (No / Temporarily / Permanently), and Send Songs to
     // Other Players. FUSERMultiplayer.dll reads the same keys from FuserNative.ini; these are the screen's copies.
     constexpr int32 kDownloadNo = 0, kDownloadTemporarily = 1, kDownloadPermanently = 2;
-    int32 g_download_songs = kDownloadPermanently; // default: the behaviour before the setting existed
+    int32 g_download_songs = kDownloadPermanently;     // default: the behaviour before the setting existed
+    int32 g_download_mix_songs = kDownloadTemporarily; // a shared mix's songs: kept for this run unless asked
     bool g_send_songs = false;                     // opt-in
     // Upload Speed Limit (SendSongsKBps, each transfer's pacing cap) and Simultaneous Uploads (SendSongsMax): read by
     // FUSERMultiplayer.dll when a transfer starts / a request arrives, so a change never touches transfers under way.
@@ -846,6 +847,11 @@ namespace
                 const int32 v = _wtoi(line.c_str() + 14);
                 if (v >= kDownloadNo && v <= kDownloadPermanently) g_download_songs = v, download_set = true;
             }
+            else if (line.rfind(L"DownloadMixSongs=", 0) == 0)
+            {
+                const int32 v = _wtoi(line.c_str() + 17);
+                if (v >= kDownloadNo && v <= kDownloadPermanently) g_download_mix_songs = v;
+            }
             else if (line.rfind(L"SendSongs=", 0) == 0)
             {
                 g_send_songs = _wtoi(line.c_str() + 10) != 0;
@@ -897,9 +903,10 @@ namespace
         static const CharType* const names[] = {STR("On idle"), STR("On hover"), STR("Off")};
         static const CharType* const labels[] = {STR("Flats"), STR("Sharps"), STR("Both")};
         static const CharType* const downloads[] = {STR("No"), STR("Temporarily"), STR("Permanently")};
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: {} -> KeyBpmDisplay {} ({}), KeyLabels {} ({}), SearchBar {}, ExtraSortOptions {}, DownloadSongs {} ({}), SendSongs {}\n"),
+        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: {} -> KeyBpmDisplay {} ({}), KeyLabels {} ({}), SearchBar {}, ExtraSortOptions {}, DownloadSongs {} ({}), "
+                                            "DownloadMixSongs {} ({}), SendSongs {}\n"),
                                         path.wstring(), g_keybpm_mode, names[g_keybpm_mode], g_key_labels, labels[g_key_labels], g_search_enabled, g_extra_sort,
-                                        g_download_songs, downloads[g_download_songs], g_send_songs);
+                                        g_download_songs, downloads[g_download_songs], g_download_mix_songs, downloads[g_download_mix_songs], g_send_songs);
     }
 
     // FuserNative.ini is shared: the settings screen's keys and every other component's (FUSERMultiplayer.dll's Host*,
@@ -915,6 +922,7 @@ namespace
             {"KeyLabels=", std::to_string(g_key_labels)},
             {"SearchBar=", g_search_enabled ? "1" : "0"},
             {"DownloadSongs=", std::to_string(g_download_songs)},
+            {"DownloadMixSongs=", std::to_string(g_download_mix_songs)},
             {"SendSongs=", g_send_songs ? "1" : "0"},
             {"SendSongsKBps=", std::to_string(g_send_kbps)},
             {"SendSongsMax=", std::to_string(g_send_max)},
@@ -3853,7 +3861,7 @@ namespace
         g_crate_mgr_synced = apply_new_crate_slots(STR("startup"));
     }
 
-    FWeakObjectPtr g_row_key_labels{}, g_row_search{}, g_row_download{}, g_row_send{}, g_row_send_kbps{}, g_row_send_max{};
+    FWeakObjectPtr g_row_key_labels{}, g_row_search{}, g_row_download{}, g_row_download_mix{}, g_row_send{}, g_row_send_kbps{}, g_row_send_max{};
 
     // The Upload Speed Limit row's entry for a cap: the nearest option.
     auto send_kbps_index(int32 kbps) -> int32
@@ -3877,7 +3885,7 @@ namespace
     }
 
     // Our rows, after ControllerPrompts in General: Key and BPM Display, Key Labels, Song Search Bar, the two crate-slot
-    // sliders, then Download Songs, Send Songs to Other Players, Upload Speed Limit and
+    // sliders, then Download Songs, Download Mix Songs, Send Songs to Other Players, Upload Speed Limit and
     // Simultaneous Uploads.
     auto inject_settings_row(UObject* screen) -> void
     {
@@ -3899,12 +3907,15 @@ namespace
         UObject* moments = songs ? make_slider_row(screen, slider_tpl, songs, STR("New Crate Snapshot Slots"), kMomentSlotsMin, kMomentSlotsMax, g_slider_moments) : nullptr;
         UObject* tail = moments ? moments : search; // the sliders need ScrollSpeedSlider; without it these follow the search toggle
         UObject* download = tail ? make_dropdown_row(screen, language, tail, STR("Download Songs"), {STR("No"), STR("Temporarily"), STR("Permanently")}) : nullptr;
-        UObject* send = download ? make_toggle_row(screen, toggle_tpl, download, STR("Send Songs to Other Players")) : nullptr;
+        UObject* download_mix = download ? make_dropdown_row(screen, language, download, STR("Download Mix Songs"), {STR("No"), STR("Temporarily"), STR("Permanently")})
+                                         : nullptr;
+        UObject* send = download_mix ? make_toggle_row(screen, toggle_tpl, download_mix, STR("Send Songs to Other Players")) : nullptr;
         UObject* send_kbps = send ? make_dropdown_row(screen, language, send, STR("Upload Speed Limit"),
                                                       {STR("256 KB/s"), STR("512 KB/s"), STR("1 MB/s"), STR("2 MB/s"), STR("4 MB/s")})
                                   : nullptr;
         UObject* send_max = send_kbps ? make_dropdown_row(screen, language, send_kbps, STR("Simultaneous Uploads"), {STR("1"), STR("2"), STR("3"), STR("4")}) : nullptr;
         g_row_download = FWeakObjectPtr(download);
+        g_row_download_mix = FWeakObjectPtr(download_mix);
         g_row_send = FWeakObjectPtr(send);
         g_row_send_kbps = FWeakObjectPtr(send_kbps);
         g_row_send_max = FWeakObjectPtr(send_max);
@@ -3953,6 +3964,7 @@ namespace
             if (UObject* row = g_row_songs.Get()) set_slider_value(row, g_slider_songs);
             if (UObject* row = g_row_moments.Get()) set_slider_value(row, g_slider_moments);
             if (UObject* row = g_row_download.Get()) set_row_value(row, g_download_songs, STR("Download Songs"));
+            if (UObject* row = g_row_download_mix.Get()) set_row_value(row, g_download_mix_songs, STR("Download Mix Songs"));
             if (UObject* row = g_row_send.Get())
             {
                 PCall init(own_fn(row, STR("InitializeToggleState"))); // as for Song Search Bar, above
@@ -4029,6 +4041,14 @@ namespace
                 g_download_songs = index;
                 save_settings();
                 Output::send<LogLevel::Normal>(STR("[FuserNative] settings: Download Songs -> {}\n"),
+                                               index == kDownloadNo ? STR("No") : index == kDownloadTemporarily ? STR("Temporarily") : STR("Permanently"));
+            }
+            // Download Mix Songs: read from the file the same way, when a shared mix is played
+            if (context == g_row_download_mix.Get() && index >= kDownloadNo && index <= kDownloadPermanently && index != g_download_mix_songs)
+            {
+                g_download_mix_songs = index;
+                save_settings();
+                Output::send<LogLevel::Normal>(STR("[FuserNative] settings: Download Mix Songs -> {}\n"),
                                                index == kDownloadNo ? STR("No") : index == kDownloadTemporarily ? STR("Temporarily") : STR("Permanently"));
             }
             // Upload Speed Limit / Simultaneous Uploads: saved; FUSERMultiplayer.dll reads them for the next transfer
