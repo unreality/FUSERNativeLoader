@@ -1,8 +1,15 @@
 bool fnl_start(void* self_module); // fnl_entry.cpp: the fue core and the FuserNative features (C++20)
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <intrin.h>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 namespace fs = std::filesystem;
 
@@ -515,6 +522,587 @@ static void ApplyGenreRequestsPatch() {
 	printf("Genre patch: live-requests genre loop not found - genre 9 stays clamped\n");
 }
 
+/*
+ * UE 4.24's FPakPlatformFile copies its mounted pak list under PakListCritical, releases the lock, then uses the copy.
+ * The DLC song preview code mounts and unmounts song paks while the song list is scrolled, and Unmount deletes the
+ * FPakFile right away - so a thread still using an older copy reads freed memory (access violation reading
+ * 0xFFFFFFFFFFFFFFFF in Strnicmp, from FPakFile::Find's StartsWith(MountPoint)).
+ *
+ * The fix at the root is to delay that delete until nothing can still hold the pak. Open file handles can hold one for
+ * any length of time, so they are counted exactly; everything else only holds a pak within one engine call, which a
+ * short minimum delay covers.
+ *
+ * The searches are also made safe on their own, in case the delayed delete cannot be installed on some build: the
+ * wrapper every crash report goes through keeps the lock until its search is done, and the search itself is hooked for
+ * its other callers.
+ */
+struct FPakListEntry {
+	uint32_t ReadOrder;
+	void *PakFile;
+};
+
+struct FPakListArray {
+	FPakListEntry *Data;
+	int32_t Num;
+	int32_t Max;
+};
+
+static bool(*FindFileInPakFiles)(
+	FPakListArray *Paks,
+	const wchar_t *Filename,
+	void **OutPakFile,
+	void *OutEntry);
+
+static bool(*PakMount)(
+	void *ths,
+	const wchar_t *InPakFilename,
+	uint32_t PakOrder,
+	const wchar_t *InPath,
+	bool bLoadIndex);
+
+static void *(*FPakFile_Delete)(void *PakFile, uint32_t Flags);
+
+// Read from the wrapper's instructions instead of hardcoded, so a build with a different class layout still works
+static uint8_t PakFilesOffset, PakListCriticalOffset;
+
+static std::atomic<byte *> PakPlatformFile{nullptr};
+
+// Only Unmount's delete is delayed; the destructor is also called by Mount to clean up a pak that failed to mount
+static byte *UnmountDeleteReturn;
+
+static bool InModule(const byte *p) {
+	return p >= Base && p < Base + ModuleSize;
+}
+
+/*
+ * The references that are not counted - a pak list copied inside an engine call, a pak returned by a search - last
+ * microseconds to a few milliseconds, so 2 seconds leaves a wide margin. Without handle counting, the delay has to
+ * cover handles too: 10 seconds also covers an asset load that was already reading from the pak.
+ */
+static constexpr ULONGLONG PakDeleteMinDelayMs = 2000;
+static constexpr ULONGLONG PakDeleteFallbackDelayMs = 10000;
+
+/*
+ * Every handle on a pak is made by CreatePakFileHandle and destroyed through slot 0 of its class's vtable, so hooking
+ * those two places is enough to count them exactly.
+ */
+static void *(*CreatePakFileHandle)(
+	void *ths,
+	const wchar_t *Filename,
+	void *PakFile,
+	const void *FileEntry);
+
+using HandleDelete = void *(*)(void *Handle, uint32_t Flags);
+
+static std::mutex PakHandlesLock;
+static std::unordered_map<void *, void *> HandleToPak;
+static std::unordered_map<void *, int32_t> OpenHandlesPerPak;
+static std::unordered_map<void *, HandleDelete> OriginalHandleDeletes;
+
+static std::atomic<bool> HandleCountingWorks{false};
+
+static void *PakHandleDelete_Hook(void *Handle, uint32_t Flags) {
+	HandleDelete originalDelete = nullptr;
+	void *pakFile = nullptr;
+	{
+		std::lock_guard<std::mutex> guard(PakHandlesLock);
+
+		// This hook is only written into vtables after their original is recorded, so the lookup cannot miss
+		originalDelete = OriginalHandleDeletes.find(*(void **)Handle)->second;
+
+		// Forgotten before the handle is freed, in case another thread gets a new handle at the same address
+		auto handle = HandleToPak.find(Handle);
+		if (handle != HandleToPak.end()) {
+			pakFile = handle->second;
+			HandleToPak.erase(handle);
+		}
+	}
+
+	void *result = originalDelete(Handle, Flags);
+
+	// Counted down only after the destructor is done, because the destructor still uses the pak
+	if (pakFile) {
+		std::lock_guard<std::mutex> guard(PakHandlesLock);
+		auto count = OpenHandlesPerPak.find(pakFile);
+		if (count != OpenHandlesPerPak.end() && --count->second <= 0) {
+			OpenHandlesPerPak.erase(count);
+		}
+	}
+	return result;
+}
+
+// Needs PakHandlesLock held
+static void HookHandleDelete(void **vtable) {
+	if (OriginalHandleDeletes.count(vtable)) {
+		return;
+	}
+
+	auto originalDelete = (HandleDelete)vtable[0];
+	DWORD old;
+	if (!InModule((byte *)vtable) ||
+		!InModule((byte *)originalDelete) ||
+		!VirtualProtect(&vtable[0], sizeof(void *), PAGE_READWRITE, &old)) {
+		// This class's handles could never be counted down, so their paks would never be deleted
+		HandleCountingWorks = false;
+		printf("Pak list race fix: handle vtable at %p not hookable - falling back to a fixed delay\n", (void *)vtable);
+		return;
+	}
+
+	OriginalHandleDeletes[vtable] = originalDelete;
+	vtable[0] = (void *)PakHandleDelete_Hook;
+	VirtualProtect(&vtable[0], sizeof(void *), old, &old);
+}
+
+void *CreatePakFileHandle_Hook(
+	void *ths,
+	const wchar_t *Filename,
+	void *PakFile,
+	const void *FileEntry) {
+	void *handle = CreatePakFileHandle(ths, Filename, PakFile, FileEntry);
+	if (!handle || !PakFile || !HandleCountingWorks) {
+		return handle;
+	}
+
+	std::lock_guard<std::mutex> guard(PakHandlesLock);
+	HookHandleDelete(*(void ***)handle);
+
+	// The fixed delay does not use the counts, and handles of an unhooked class would never be removed
+	if (!HandleCountingWorks) {
+		HandleToPak.clear();
+		OpenHandlesPerPak.clear();
+		return handle;
+	}
+
+	// An address still listed belonged to a handle destroyed some other way, so that handle is closed now
+	auto [entry, inserted] = HandleToPak.try_emplace(handle, PakFile);
+	if (!inserted) {
+		auto count = OpenHandlesPerPak.find(entry->second);
+		if (count != OpenHandlesPerPak.end() && --count->second <= 0) {
+			OpenHandlesPerPak.erase(count);
+		}
+		entry->second = PakFile;
+	}
+	OpenHandlesPerPak[PakFile]++;
+
+	return handle;
+}
+
+// Takes PakHandlesLock inside PendingPakDeletesLock; nothing takes them the other way round
+static bool CanDeletePak(void *PakFile, ULONGLONG unmountedFor) {
+	if (!HandleCountingWorks) {
+		return unmountedFor >= PakDeleteFallbackDelayMs;
+	}
+	if (unmountedFor < PakDeleteMinDelayMs) {
+		return false;
+	}
+	std::lock_guard<std::mutex> guard(PakHandlesLock);
+	return OpenHandlesPerPak.count(PakFile) == 0;
+}
+
+struct PendingPakDelete {
+	void *PakFile;
+	uint32_t Flags;
+	ULONGLONG UnmountedAt;
+};
+
+static std::vector<PendingPakDelete> PendingPakDeletes;
+static std::mutex PendingPakDeletesLock;
+
+static std::vector<PendingPakDelete> TakeDuePakDeletes() {
+	const ULONGLONG now = GetTickCount64();
+	std::lock_guard<std::mutex> guard(PendingPakDeletesLock);
+
+	auto firstDue = std::stable_partition(
+		PendingPakDeletes.begin(),
+		PendingPakDeletes.end(),
+		[now](const PendingPakDelete &pending) { return !CanDeletePak(pending.PakFile, now - pending.UnmountedAt); });
+	std::vector<PendingPakDelete> due(firstDue, PendingPakDeletes.end());
+	PendingPakDeletes.erase(firstDue, PendingPakDeletes.end());
+	return due;
+}
+
+// Called under PakListCritical, as the engine's own delete is, and outside our locks: the destructor waits for the
+// pak's signature-check thread to stop
+static void DeletePaks(const std::vector<PendingPakDelete> &paks) {
+	for (const PendingPakDelete &pending : paks) {
+		FPakFile_Delete(pending.PakFile, pending.Flags);
+	}
+}
+
+__declspec(noinline) void *FPakFile_Delete_Hook(void *PakFile, uint32_t Flags) {
+	if (_ReturnAddress() != UnmountDeleteReturn) {
+		return FPakFile_Delete(PakFile, Flags);
+	}
+
+	std::vector<PendingPakDelete> due = TakeDuePakDeletes();
+	{
+		std::lock_guard<std::mutex> guard(PendingPakDeletesLock);
+		PendingPakDeletes.push_back({PakFile, Flags, GetTickCount64()});
+	}
+	DeletePaks(due);
+
+	// A scalar deleting destructor returns its object; Unmount ignores it
+	return PakFile;
+}
+
+bool PakMount_Hook(
+	void *ths,
+	const wchar_t *InPakFilename,
+	uint32_t PakOrder,
+	const wchar_t *InPath,
+	bool bLoadIndex) {
+	PakPlatformFile.store(static_cast<byte *>(ths));
+
+	// Without this, the last paks unmounted would wait for the next Unmount, possibly for the rest of the session
+	std::vector<PendingPakDelete> due = TakeDuePakDeletes();
+	if (!due.empty()) {
+		auto *lock = reinterpret_cast<CRITICAL_SECTION *>(static_cast<byte *>(ths) + PakListCriticalOffset);
+		EnterCriticalSection(lock);
+		DeletePaks(due);
+		LeaveCriticalSection(lock);
+	}
+
+	return PakMount(ths, InPakFilename, PakOrder, InPath, bLoadIndex);
+}
+
+/*
+ * Needs PakListCritical held. Entries are matched on the read order as well as the address, so a stale entry whose
+ * address was reused by a newly mounted pak is dropped too, instead of searching the new pak at the old one's priority.
+ */
+static void DropUnmountedPaks(FPakListArray &paks, const FPakListArray &mounted) {
+	if (paks.Num <= 0) {
+		return;
+	}
+
+	// Nearly every search: nothing was mounted or unmounted since the copy was taken, so skip the sort
+	const size_t listBytes = paks.Num * sizeof(FPakListEntry);
+	if (paks.Num == mounted.Num && memcmp(paks.Data, mounted.Data, listBytes) == 0) {
+		return;
+	}
+
+	using Entry = std::pair<void *, uint32_t>;
+	static thread_local std::vector<Entry> live;
+	live.clear();
+	for (int32_t i = 0; i < mounted.Num; i++) {
+		live.emplace_back(mounted.Data[i].PakFile, mounted.Data[i].ReadOrder);
+	}
+	std::sort(live.begin(), live.end());
+
+	// The order is kept because it is the search priority
+	int32_t kept = 0;
+	for (int32_t i = 0; i < paks.Num; i++) {
+		const Entry entry(paks.Data[i].PakFile, paks.Data[i].ReadOrder);
+		if (std::binary_search(live.begin(), live.end(), entry)) {
+			paks.Data[kept] = paks.Data[i];
+			kept++;
+		}
+	}
+	paks.Num = kept;
+}
+
+bool FindFileInPakFiles_Hook(
+	FPakListArray *Paks,
+	const wchar_t *Filename,
+	void **OutPakFile,
+	void *OutEntry) {
+	byte *pakPlatformFile = PakPlatformFile.load();
+
+	// Nothing has been mounted yet, so nothing can have been unmounted either
+	if (!pakPlatformFile) {
+		return FindFileInPakFiles(Paks, Filename, OutPakFile, OutEntry);
+	}
+
+	auto *lock = reinterpret_cast<CRITICAL_SECTION *>(pakPlatformFile + PakListCriticalOffset);
+	auto *mounted = reinterpret_cast<FPakListArray *>(pakPlatformFile + PakFilesOffset);
+
+	EnterCriticalSection(lock);
+	DropUnmountedPaks(*Paks, *mounted);
+	bool found = FindFileInPakFiles(Paks, Filename, OutPakFile, OutEntry);
+	LeaveCriticalSection(lock);
+
+	return found;
+}
+
+// A rel32 counts from the end of its instruction, and the displacement is always the instruction's last 4 bytes
+static byte *Rel32Target(byte *displacement) {
+	return displacement + 4 + *(int32_t *)displacement;
+}
+
+static byte *FindPatternIn(byte *start, size_t size, const char *byteSequence) {
+	auto data = HexToBytes(byteSequence);
+	for (size_t i = 0; i + data.size() <= size; i++) {
+		bool match = true;
+		for (size_t j = 0; j < data.size(); j++) {
+			if (start[i + j] != data[j] && byteSequence[j * 2] != '?') {
+				match = false;
+				break;
+			}
+		}
+		if (match) {
+			return start + i;
+		}
+	}
+	return nullptr;
+}
+
+// setup_hook installs even after a failed step and cannot report failure; the fallbacks here depend on knowing
+static bool InstallHook(void **target, void *hook) {
+	void *function = *target;
+	auto handle = funchook_create();
+
+	bool installed =
+		funchook_prepare(handle, target, hook) == FUNCHOOK_ERROR_SUCCESS &&
+		hook_in_range(function, *target) &&
+		funchook_install(handle, 0) == FUNCHOOK_ERROR_SUCCESS;
+	if (!installed) {
+		funchook_destroy(handle);
+		*target = function;
+	}
+	return installed;
+}
+
+/*
+ * The destructor hook keeps paks alive, so a wrong match would delay deleting something else. The delete call has to
+ * be inside Unmount and right after the same LeaveCriticalSection import the wrapper uses.
+ */
+static void InstallDelayedPakDelete(byte *leaveSlot) {
+	byte *unmount = find_function(
+		"FPakPlatformFile_Unmount",
+		"40535557415441554883ec30833d????????004c8be2488be97422488b1d");
+	if (!unmount) {
+		printf("Pak list race fix: Unmount not found - pak deletes not delayed\n");
+		return;
+	}
+
+	byte *deleteCall = FindPatternIn(
+		unmount,
+		0x200,
+		"488d0d????????"    // lea    rcx,[pak signatures lock]
+		"ff15????????"      // call   [LeaveCriticalSection]
+		"488b4e08"          // mov    rcx,[rsi+8]                    (the FPakFile being unmounted)
+		"4885c9"            // test   rcx,rcx
+		"740a"              // je     (no pak)
+		"ba01000000"        // mov    edx,1                          (delete flag)
+		"e8????????");      // call   FPakFile's scalar deleting destructor
+	byte *fpakFileDelete = deleteCall ? Rel32Target(deleteCall + 28) : nullptr;
+	if (!deleteCall || Rel32Target(deleteCall + 9) != leaveSlot || !InModule(fpakFileDelete)) {
+		printf("Pak list race fix: Unmount's delete is not as expected - pak deletes not delayed\n");
+		return;
+	}
+
+	UnmountDeleteReturn = deleteCall + 32;
+	FPakFile_Delete = (decltype(FPakFile_Delete))fpakFileDelete;
+	if (!InstallHook((void **)&FPakFile_Delete, FPakFile_Delete_Hook)) {
+		printf("Pak list race fix: FPakFile delete hook not installed - pak deletes not delayed\n");
+		return;
+	}
+	printf("Pak list race fix: Unmount's deletes delayed\n");
+}
+
+/*
+ * A wrong match would count something else, and its paks could be deleted while still in use. OpenRead searches for
+ * the file and then makes a handle on the pak it was found in, so every call has to come shortly after a search.
+ */
+static void InstallHandleCounting(byte *findFileInPakFiles) {
+	byte *create = find_function(
+		"FPakPlatformFile_CreatePakFileHandle",
+		"4c8bdc574881ec90000000488b05????????4833c44889442470488b410849895b0849896b10498be9");
+	if (!create) {
+		printf("Pak list race fix: CreatePakFileHandle not found - open handles not counted\n");
+		return;
+	}
+
+	// The pak code is laid out together, so scanning near it finds its callers without scanning the whole exe again
+	byte *from = std::max(std::min(create, findFileInPakFiles) - 0x40000, Base + 0x80);
+	byte *to = std::min(std::max(create, findFileInPakFiles) + 0x40000, Base + ModuleSize - 5);
+	int calls = 0;
+	int callsAfterSearch = 0;
+	for (byte *call = from; call < to; call++) {
+		if (call[0] != 0xE8 || Rel32Target(call + 1) != create) {
+			continue;
+		}
+		calls++;
+		for (byte *search = call - 0x80; search < call; search++) {
+			if (search[0] == 0xE8 && Rel32Target(search + 1) == findFileInPakFiles) {
+				callsAfterSearch++;
+				break;
+			}
+		}
+	}
+	if (calls == 0 || callsAfterSearch != calls) {
+		printf(
+			"Pak list race fix: CreatePakFileHandle at RVA 0x%llx is not as expected - open handles not counted\n",
+			(unsigned long long)(create - Base));
+		return;
+	}
+
+	CreatePakFileHandle = (decltype(CreatePakFileHandle))create;
+	if (!InstallHook((void **)&CreatePakFileHandle, CreatePakFileHandle_Hook)) {
+		printf("Pak list race fix: CreatePakFileHandle hook not installed - open handles not counted\n");
+		return;
+	}
+	HandleCountingWorks = true;
+	printf("Pak list race fix: open handles counted\n");
+}
+
+/*
+ * The search hook needs the FPakPlatformFile, which FindFileInPakFiles is not given; Mount records it before the
+ * first pak is added, so it is known before any pak can be in a copied list. Mount's `this` is used as the lock, so a
+ * wrong match would have every pak search lock memory that is not a lock: Mount has to lock PakListCritical at the
+ * offset the wrapper uses.
+ */
+static void InstallSearchHook(byte *enterSlot, byte *findFileInPakFiles) {
+	byte *mount = find_function(
+		"FPakPlatformFile_Mount",
+		"488bc4448940184889480855534157488d68a94881ecd000000048897010");
+	if (!mount) {
+		printf("Pak list race fix: Mount not found - other FindFileInPakFiles callers not covered\n");
+		return;
+	}
+
+	bool locksPakList = false;
+	for (byte *p = mount; p < mount + 0x800 && InModule(p + 10); p++) {
+		bool leaRcx = p[0] == 0x48 && p[1] == 0x8D && (p[2] & 0xF8) == 0x48 && (p[2] & 0x07) != 0x04;
+		if (leaRcx && p[3] == PakListCriticalOffset && p[4] == 0xFF && p[5] == 0x15 && Rel32Target(p + 6) == enterSlot) {
+			locksPakList = true;
+			break;
+		}
+	}
+	if (!locksPakList) {
+		printf("Pak list race fix: Mount at RVA 0x%llx is not as expected - other FindFileInPakFiles callers not covered\n",
+			(unsigned long long)(mount - Base));
+		return;
+	}
+
+	PakMount = (decltype(PakMount))mount;
+	FindFileInPakFiles = (decltype(FindFileInPakFiles))findFileInPakFiles;
+	if (!InstallHook((void **)&PakMount, PakMount_Hook)) {
+		printf("Pak list race fix: Mount hook not installed - other FindFileInPakFiles callers not covered\n");
+		return;
+	}
+	if (!InstallHook((void **)&FindFileInPakFiles, FindFileInPakFiles_Hook)) {
+		printf("Pak list race fix: FindFileInPakFiles hook not installed - other callers not covered\n");
+		return;
+	}
+	printf("Pak list race fix: FindFileInPakFiles callers covered\n");
+}
+
+static void ApplyPakListRaceFix() {
+	/*
+	 * The ?? bytes are the parts that can differ between game builds (addresses and FPakPlatformFile member offsets),
+	 * so one pattern should match both the EGS and Steam executables. If it matches nothing, nothing is changed and
+	 * the game runs as it would without the fix.
+	 */
+	byte *wrapper = find_function(
+		"FindFileInPakFiles_Wrapper",
+		"33ff"              // xor    edi,edi
+		"488d59??"          // lea    rbx,[rcx+PakListCritical]
+		"4c8bf1"            // mov    r14,rcx                        (r14 = this)
+		"48897c2420"        // mov    [rsp+20h],rdi                  (local pak list copy)
+		"488bcb"            // mov    rcx,rbx
+		"48897c2428"        // mov    [rsp+28h],rdi
+		"4d8bf9"            // mov    r15,r9
+		"4d8be0"            // mov    r12,r8
+		"4c8bea"            // mov    r13,rdx
+		"8bf7"              // mov    esi,edi
+		"ff15????????"      // call   [EnterCriticalSection]
+		"49636e??"          // movsxd rbp,[r14+PakFiles.Num]
+		"85ed"              // test   ebp,ebp
+		"7437"              // je     (empty list)
+		"7e15"              // jle
+		"8bd5"              // mov    edx,ebp
+		"488d4c2420"        // lea    rcx,[rsp+20h]
+		"e8????????"        // call   (grow the copy)
+		"8b742428"          // mov    esi,[rsp+28h]
+		"488b7c2420"        // mov    rdi,[rsp+20h]
+		"498b56??"          // mov    rdx,[r14+PakFiles.Data]
+		"4c8bc5"            // mov    r8,rbp
+		"4863ce"            // movsxd rcx,esi
+		"48c1e104"          // shl    rcx,4
+		"4803cf"            // add    rcx,rdi
+		"49c1e004"          // shl    r8,4
+		"e8????????"        // call   memcpy                         (copy the list)
+		"03f5"              // add    esi,ebp
+		"89742428"          // mov    [rsp+28h],esi
+		"488bcb"            // mov    rcx,rbx                        <- patched from here (offset 0x66)
+		"ff15????????"      // call   [LeaveCriticalSection]
+		"4d8bcf"            // mov    r9,r15
+		"488d4c2420"        // lea    rcx,[rsp+20h]
+		"4d8bc4"            // mov    r8,r12
+		"498bd5"            // mov    rdx,r13
+		"e8????????"        // call   FindFileInPakFiles             (search the copy)
+		"0fb6d8");          // movzx  ebx,al                         <- to here
+	if (!wrapper) {
+		printf("Pak list race fix: FindFileInPakFiles wrapper not found - not applied\n");
+		return;
+	}
+
+	PakListCriticalOffset = wrapper[0x05];
+	const uint8_t pakFilesNumOffset = wrapper[0x2A];
+	PakFilesOffset = wrapper[0x49];
+	byte *enterSlot = Rel32Target(wrapper + 0x23);
+	byte *site = wrapper + 0x66;
+	byte *leaveSlot = Rel32Target(site + 5);
+	byte *findFileInPakFiles = Rel32Target(site + 24);
+
+	/*
+	 * Patching or hooking the wrong code would crash the game, so the match has to be this function:
+	 * - both `call [...]` instructions go through the exe's import slots for EnterCriticalSection and
+	 *   LeaveCriticalSection (the slot holds the address Windows filled in, the same one GetProcAddress returns);
+	 * - the search the wrapper calls is inside the game exe;
+	 * - the pak list's element count sits 8 bytes after its data pointer, as it does in a UE TArray.
+	 */
+	HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+	void *enterCriticalSection = (void *)GetProcAddress(kernel32, "EnterCriticalSection");
+	void *leaveCriticalSection = (void *)GetProcAddress(kernel32, "LeaveCriticalSection");
+
+	bool expected =
+		InModule(enterSlot) &&
+		InModule(leaveSlot) &&
+		InModule(findFileInPakFiles) &&
+		*(void **)enterSlot == enterCriticalSection &&
+		*(void **)leaveSlot == leaveCriticalSection &&
+		pakFilesNumOffset == PakFilesOffset + 8;
+	if (!expected) {
+		printf(
+			"Pak list race fix: wrapper at RVA 0x%llx is not as expected - not applied\n",
+			(unsigned long long)(wrapper - Base));
+		return;
+	}
+
+	InstallDelayedPakDelete(leaveSlot);
+	InstallHandleCounting(findFileInPakFiles);
+
+	// LeaveCriticalSection moved after the search, so no pak in the copy can be deleted while it is searched
+	uint8_t patch[31] = {
+		0x4D, 0x8B, 0xCF,               // mov   r9,r15
+		0x48, 0x8D, 0x4C, 0x24, 0x20,   // lea   rcx,[rsp+20h]
+		0x4D, 0x8B, 0xC4,               // mov   r8,r12
+		0x49, 0x8B, 0xD5,               // mov   rdx,r13
+		0xE8, 0, 0, 0, 0,               // call  FindFileInPakFiles
+		0x48, 0x8B, 0xCB,               // mov   rcx,rbx   (rbx is callee-saved, so the search left the lock in it)
+		0x0F, 0xB6, 0xD8,               // movzx ebx,al    (the code after the patch reads the result from bl)
+		0xFF, 0x15, 0, 0, 0, 0,         // call  [LeaveCriticalSection]
+	};
+	// The calls moved, and a rel32 counts from its own instruction's end
+	*(int32_t *)(patch + 15) = (int32_t)(findFileInPakFiles - (site + 19));
+	*(int32_t *)(patch + 27) = (int32_t)(leaveSlot - (site + 31));
+
+	DWORD old;
+	if (!VirtualProtect(site, sizeof(patch), PAGE_EXECUTE_READWRITE, &old)) {
+		printf("Pak list race fix: VirtualProtect failed (%lu) - wrapper not patched\n", GetLastError());
+	} else {
+		memcpy(site, patch, sizeof(patch));
+		VirtualProtect(site, sizeof(patch), old, &old);
+		FlushInstructionCache(GetCurrentProcess(), site, sizeof(patch));
+		printf(
+			"Pak list race fix: wrapper patched at RVA 0x%llx\n",
+			(unsigned long long)(site - Base));
+	}
+
+	InstallSearchHook(enterSlot, findFileInPakFiles);
+}
+
 void FUSER_HOOK() {
 	Base = (byte*)GetModuleHandleA("Fuser-Win64-Shipping.exe");
 	if (Base == 0) {
@@ -619,6 +1207,7 @@ BOOL WINAPI DllMain(HMODULE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 		FUSER_HOOK();
 		ApplyBpmPatches();
 		ApplyGenreRequestsPatch();
+		ApplyPakListRaceFix();
 		// the UE 4.24 reflection core (fue), the runtime unlocks and the FuserNative features
 		fnl_start(hinstDLL);
 	}
