@@ -12,10 +12,12 @@ features built in - derived from UE4SS) plus a small content pak.
 - **Key and BPM on the crate editor's song tiles**, above each song's title (hidden when *Key and BPM Display* is Off).
 - **Song search** in the crate editor's song library 
   - Controlled by Settings > General > *Song Search Bar* on / off.
-  - Filter words narrow the list by key or tempo, alone or with a title / artist search:
+  - Filter words narrow the list by key, tempo or genre, alone or with a title / artist search:
     - `key:Am` (A minor), `key:C` (C major or minor), `key:Cmaj` (C major only), `key:F#m,Gb` (several keys);
       sharps as `#`, flats as `b`;
-    - `bpm:120`, `bpm:90-110`, `bpm:140-` (140 or faster), `bpm:-100` (100 or slower).
+    - `bpm:120`, `bpm:90-110`, `bpm:140-` (140 or faster), `bpm:-100` (100 or slower);
+    - `genre:rock`, `genre:pop,hiphop` (several genres). Genres: `classical`, `country`, `dance` (or `edm`),
+      `hiphop` (or `rap`), `latin`, `pop`, `rnb` (or `r&b`), `rock`, `indie` (or `alternative`).
 - **Sort by Key or BPM** in the crate editor's song library, from the Sort dropdown. Key sorts C to B, major before
   minor; songs without a known key or BPM go last.
 - **Edit larger crates**: as many song and snapshot tabs as the crate holds (e.g. 8 song tabs for 64 songs).

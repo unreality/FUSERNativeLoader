@@ -15,6 +15,12 @@ add_library(FUSERNativeLoader SHARED
     src/winhttp_proxy.cpp
     src/fnl_entry.cpp
     src/unlocks.cpp
+    src/data_table.cpp
+    src/custom_content.cpp
+    src/content/content_types.cpp
+    src/content/content_unlocks.cpp
+    src/content/content_projector.cpp
+    src/content/content_outfit.cpp
     src/fue/fue.cpp
     src/native/fusernative.cpp
     src/debug/unlock_probe.cpp
@@ -29,7 +35,8 @@ target_compile_options(FUSERNativeLoader PRIVATE /utf-8 /EHsc /Zi) # /Zi: a PDB 
 target_link_options(FUSERNativeLoader PRIVATE /DEBUG /OPT:REF /OPT:ICF /IGNORE:4099) # 4099: the prebuilt funchook.lib has no PDB
 
 # fue and the code on it are C++20 (std::format); the original loader source (dllmain.cpp) stays C++17.
-set_source_files_properties(src/fnl_entry.cpp src/unlocks.cpp src/fue/fue.cpp src/native/fusernative.cpp src/debug/unlock_probe.cpp
+set_source_files_properties(src/fnl_entry.cpp src/unlocks.cpp src/data_table.cpp src/custom_content.cpp src/content/content_types.cpp
+                            src/content/content_unlocks.cpp src/content/content_projector.cpp src/content/content_outfit.cpp src/fue/fue.cpp src/native/fusernative.cpp src/debug/unlock_probe.cpp
                             PROPERTIES COMPILE_OPTIONS "/std:c++20")
 
 # Optional multiplayer extension. It uses the core's fue hook dispatcher and reflection API,
@@ -40,6 +47,7 @@ add_library(FUSERMultiplayer SHARED
     src/multiplayer/p2p_tunnel.cpp
     src/multiplayer/pak_check.cpp
     src/multiplayer/community_fetch.cpp
+    src/multiplayer/server_content.cpp
 )
 set_target_properties(FUSERMultiplayer PROPERTIES OUTPUT_NAME "FUSERMultiplayer")
 target_include_directories(FUSERMultiplayer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/lib")

@@ -172,6 +172,7 @@ namespace
 
 auto fusernative_start() -> void; // native/fusernative.cpp
 auto unlocks_start() -> void;     // unlocks.cpp
+auto custom_content_start() -> void; // custom_content.cpp
 auto unlock_probe_start() -> void; // unlock_probe.cpp (debug builds)
 
 namespace
@@ -205,7 +206,7 @@ auto fnl_load_optional_multiplayer() -> void
     start_optional_multiplayer();
 }
 
-// The loader's entry (dllmain.cpp, after FUSER_HOOK): the fue core, the unlocks, then FuserNative.
+// The loader's entry (dllmain.cpp, after FUSER_HOOK): the fue core, the unlocks, custom content, then FuserNative.
 // The multiplayer extension is loaded on the first engine callback; the probe (F9) is debug-only.
 bool fnl_start(void* self_module)
 {
@@ -215,6 +216,7 @@ bool fnl_start(void* self_module)
         if (!g_eos_shutdown_installed) install_eos_shutdown_guard();
     });
     unlocks_start(); // first: its unreal-init step must precede UnlockMgr's init
+    custom_content_start(); // its rows, too, must precede UnlockMgr's and UVenueMgr's table reads
     fusernative_start();
 #if FNL_DEBUG
     unlock_probe_start();

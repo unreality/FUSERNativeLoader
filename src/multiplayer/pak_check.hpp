@@ -29,7 +29,10 @@ namespace p2p
     //              the .sig is rewritten with the pak's real chunk hashes;
     //   Bad      - anything else (unreadable .sig, another signature block, a stale table on an inconsistent pak):
     //              refuse the song.
-    // note says what was repaired, or why the song is Bad.
+    // note says what was repaired, or why the song is Bad. max_pak_bytes: the largest pak read (server content paks
+    // may be larger than songs).
     enum class SigVerdict { Ok, Repaired, Bad };
-    auto check_song_sig(const std::wstring& pak, const std::wstring& sig, std::string* note) -> SigVerdict;
+    auto check_song_sig(const std::wstring& pak, const std::wstring& sig, std::string* note,
+                        unsigned long long max_pak_bytes = kMaxSongPakBytes) -> SigVerdict;
+    constexpr unsigned long long kMaxContentPakBytes = 2048ull * 1024 * 1024;
 } // namespace p2p

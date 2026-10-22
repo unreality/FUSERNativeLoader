@@ -2,7 +2,7 @@
 
 The FUSER mod loader (a `winhttp.dll` proxy, based on the community FuserSongLoader) with a minimal UE 4.24
 reflection core (**fue**) and the **FuserNative** features built in: key/BPM on the HUD song items and the crate
-editor's song tiles, Key Labels, real song tabs, song search with `key:` / `bpm:` filter words, Key and BPM sorting,
+editor's song tiles, Key Labels, real song tabs, song search with `key:` / `bpm:` / `genre:` filter words, Key and BPM sorting,
 crate-edit tabs, new-crate slot sizes, the mod settings rows, and free unlocks for custom and event songs. Three build
 outputs:
 
@@ -50,6 +50,9 @@ $env:FUSER_GAME_ROOT = '<folder containing Fuser\>'
 Settings: `Fuser\Binaries\Win64\FuserNative.ini`; log: `Fuser\Binaries\Win64\FuserNative.log`.
 `ExtraSortOptions=0` in the ini removes Key and BPM from the crate editor's Sort dropdown (no Settings row).
 Remove or rename `FUSERMultiplayer.dll` to run the base FUSERNative features without multiplayer hooks.
+Custom content paks (`tools/fuser_content_pak.py`) go in `Fuser\Content\Paks\custom_content\`, next to `custom_songs\`.
+Server content (fuserd's items, kept by the multiplayer DLL) lives in `Fuser\Content\ServerContent\`; `ServerContentWaitSeconds`
+(default 30, 0 = never) caps how long the title screen waits for the login sync before the main menu.
 The multiplayer DLL requires `winhttp.dll` and is not a standalone proxy.
 
 ## Layout
@@ -57,18 +60,23 @@ The multiplayer DLL requires `winhttp.dll` and is not a standalone proxy.
 | Path | |
 |---|---|
 | `src/dllmain.cpp` | the loader (proxy exports, pak-signature bypass, BPM patches, legacy unlock-pak rename) |
-| `src/fnl_entry.cpp` | `fnl_start`: fue, unlocks, FuserNative; the debug fue probe |
+| `src/fnl_entry.cpp` | `fnl_start`: fue, unlocks, custom content, FuserNative; the debug fue probe |
 | `src/fue/` | the reflection core: objects, properties, ProcessEvent / tick / native hooks, per-build addresses |
 | `src/unlocks.cpp` | custom and event song unlocks, patched into the live `DT_UnlocksSongs` at startup |
+| `src/custom_content.cpp` | custom and server content (`custom_content.hpp`): the content pak reader, the item registry, the startup registration (`custom_content/` free, server content locked) and the live one |
+| `src/content/` | the content types (`content_types.cpp`: one handler per type; `content_projector.cpp`: projector screens) and the unlock rows every type shares (`content_unlocks.cpp`) |
+| `src/data_table.cpp` | `UDataTable` loading, row walking and `AddRow`, shared by the table patches; inserting into the managers' `TMap<FName, …>`s after boot |
 | `src/native/fusernative.cpp` | the FuserNative features |
 | `src/debug/unlock_probe.cpp` | debug builds: unlock-state probe (F10) |
-| `src/multiplayer/` | optional multiplayer DLL: matchmaking join, P2P tunnel, custom song sync, Diamond store |
+| `src/multiplayer/` | optional multiplayer DLL: matchmaking join, P2P tunnel, custom song sync, Diamond store, server content (`server_content.cpp`) |
 | `lib/` | funchook (prebuilt `funchook.lib` + header); `lib/libarchive/`: static libarchive 3.8.9 + zlib 1.3.2 for the multiplayer DLL's community song archives, rebuilt by `tools/build_libarchive.ps1` |
 | `assets/Content/` | the cooked assets packed into `FUSERNativeMods_P.pak` |
 | `modkit/FuserModkit/` | the UE 4.24 editor project those assets are authored and cooked in |
 | `docs/MOD_DEVELOPMENT.md` | a step-by-step tutorial for adding a new feature (assets, native code, settings, pak) |
+| `CUSTOM_CONTENT.MD` | custom content (projector screens): pak format, loading requirements, test results, content tiers |
 | `package/README.md` | the player README (`{{VERSION}}` filled in by `build.ps1 -Package`) |
 | `tools/fuser_pak_create.py` | pak + sig writer |
+| `tools/fuser_content_pak.py` | packs a custom content item (a projector screen video) into `<id>_P.pak` + `.sig` for `custom_content/` |
 | `tools/derive_build.py` | derives fue's addresses for another FUSER executable (e.g. Steam) by static analysis |
 | `tools/derive_mp_build.py` | derives `FUSERMultiplayer.dll`'s ~30 game addresses for another executable (`host_hook.cpp`, `kVerified`) |
 

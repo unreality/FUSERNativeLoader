@@ -19,8 +19,10 @@
 #include <Windows.h>
 
 #include "fue/fue.hpp"
+#include "custom_content.hpp"
 #include "multiplayer/community_fetch.hpp"
 #include "multiplayer/json_lite.hpp"
+#include "multiplayer/mp_shared.hpp"
 #include "multiplayer/p2p_tunnel.hpp"
 #include "multiplayer/pak_check.hpp"
 
@@ -94,6 +96,8 @@ namespace
         uintptr_t new_highway_event, ec_list_done, ec_purchase_done, claimed_done, ec_purchase_request;
         // shared mixes
         uintptr_t playback_load;
+        // server content: the title screen's state setter (the login sync's hold before the main menu)
+        uintptr_t title_set_state;
     };
     constexpr VerifiedBuild kVerified[] = {
         {.name = STR("EGS v1.4.2"),
@@ -107,7 +111,7 @@ namespace
             .unlock_map_find = 0x4640e0, .unlock_map_alloc = 0x341bf0, .fname_hash = 0x9eab10,
             .unlock_map_link = 0x358bc0, .new_highway_event = 0x771540, .ec_list_done = 0x790530,
             .ec_purchase_done = 0x791730, .claimed_done = 0x7901c0, .ec_purchase_request = 0x789280,
-            .playback_load = 0x658a70},
+            .playback_load = 0x658a70, .title_set_state = 0x78d190},
         // derived by tools/derive_mp_build.py (2026-10-04): every address CONFIRMED, every body the same
         {.name = STR("EGS CL1317808"),
             .drop_song_item_play = 0x7b3500, .drop_desk_spawn_disc = 0x5fdbd0,
@@ -120,7 +124,7 @@ namespace
             .unlock_map_find = 0x4640e0, .unlock_map_alloc = 0x341bf0, .fname_hash = 0x9eab40,
             .unlock_map_link = 0x358bc0, .new_highway_event = 0x771570, .ec_list_done = 0x790560,
             .ec_purchase_done = 0x791760, .claimed_done = 0x7901f0, .ec_purchase_request = 0x7892b0,
-            .playback_load = 0x658a70},
+            .playback_load = 0x658a70, .title_set_state = 0x78d1c0},
         {.name = STR("Steam CL1317755"),
             .drop_song_item_play = 0x7e8ec0, .drop_desk_spawn_disc = 0x6347d0,
             .drop_local_disc_spawn = 0x646a90, .drop_send_spawn_disc = 0x6c0c40, .deck_disc_of = 0x664380,
@@ -132,7 +136,7 @@ namespace
             .unlock_map_find = 0x464660, .unlock_map_alloc = 0x341fc0, .fname_hash = 0xa20020,
             .unlock_map_link = 0x358f90, .new_highway_event = 0x7a6ef0, .ec_list_done = 0x7c5ef0,
             .ec_purchase_done = 0x7c70f0, .claimed_done = 0x7c5b80, .ec_purchase_request = 0x7bec40,
-            .playback_load = 0x68e900},
+            .playback_load = 0x68e900, .title_set_state = 0x7c2b50},
     };
     // every member after the name is a uintptr_t: complete() walks them as an array
     constexpr size_t kAddrCount = (sizeof(VerifiedBuild) - offsetof(VerifiedBuild, drop_song_item_play)) / sizeof(uintptr_t);
@@ -4996,8 +5000,67 @@ namespace
     }
 
     // FUN_140790530: the Diamond Store list arrived; its tiles are built next.
+    // Before the game builds its offers: an offer whose (non-song) asset this game has no unlock row for - a server
+    // content item that hasn't downloaded or registered yet - is left out, since its tile and purchase need the row.
+    // FGetElderCreditStoreItemsResponse in the job: featured_items @0x30, store_items @0x40, TArrays of
+    // FElderCreditStoreItem. The offers and their FAssetDetails are reflected: their sizes and the asset's
+    // asset_name / asset_type_val offsets are read from the structs, and the filter stays off when an offer isn't the
+    // 0x78 bytes FUN_140790530 steps by. A left-out offer is destroyed through its struct's properties and the rest
+    // moved down, as TArray::RemoveAt does.
+    auto drop_unusable_offers(uint64* done) -> void
+    {
+        if (!done || !done[0] || !reinterpret_cast<const uint8*>(done)[0x10]) return;
+        auto* offer_st = UObjectGlobals::StaticFindObject<UStruct*>(nullptr, nullptr, STR("/Script/Hype.ElderCreditStoreItem"));
+        auto* asset_st = UObjectGlobals::StaticFindObject<UStruct*>(nullptr, nullptr, STR("/Script/Hype.AssetDetails"));
+        FProperty* p_assets = offer_st ? offer_st->FindProperty(FName(STR("assets"))) : nullptr;
+        FProperty* p_name = asset_st ? asset_st->FindProperty(FName(STR("asset_name"))) : nullptr;
+        FProperty* p_type = asset_st ? asset_st->FindProperty(FName(STR("asset_type_val"))) : nullptr;
+        constexpr int32 kOffer = 0x78; // FUN_140790530's stride
+        if (!offer_st || !asset_st || !p_assets || !p_name || !p_type || offer_st->GetPropertiesSize() != kOffer)
+        {
+            static bool told = false;
+            if (!std::exchange(told, true))
+                Output::send<LogLevel::Warning>(STR("[store] Diamond Store offer structs not as expected - offers for missing items are not filtered\n"));
+            return;
+        }
+        const size_t offer_size = static_cast<size_t>(kOffer), asset_size = static_cast<size_t>(asset_st->GetPropertiesSize());
+        uint8* job = reinterpret_cast<uint8*>(done[0]);
+        for (size_t list : {size_t{0x30}, size_t{0x40}})
+        {
+            auto* offers = reinterpret_cast<TArray<uint8>*>(job + list); // elements are offer_size bytes
+            uint8* data = offers->Data;
+            for (int32 i = 0; data && i < offers->ArrayNum;)
+            {
+                uint8* offer = data + static_cast<size_t>(i) * offer_size;
+                const auto* assets = p_assets->ContainerPtrToValuePtr<TArray<uint8>>(offer);
+                bool ok = true;
+                for (int32 a = 0; assets->Data && a < assets->ArrayNum && ok; ++a)
+                {
+                    const uint8* asset = assets->Data + static_cast<size_t>(a) * asset_size;
+                    const FName name = *p_name->ContainerPtrToValuePtr<FName>(asset);
+                    const uint8 type = *p_type->ContainerPtrToValuePtr<uint8>(asset); // as FUN_140790530 reads it
+                    if (!mp::server_content_offer_ok(name, type))
+                    {
+                        ok = false;
+                        Output::send<LogLevel::Warning>(STR("[store] Diamond Store offer {} left out: {} isn't on this machine yet\n"), fstring_at(offer),
+                                                        name.ToString());
+                    }
+                }
+                if (ok)
+                {
+                    ++i;
+                    continue;
+                }
+                for (FProperty* p : TFieldRange<FProperty>(offer_st, EFieldIterationFlags::IncludeSuper)) p->DestroyValue_InContainer(offer);
+                std::memmove(offer, offer + offer_size, static_cast<size_t>(offers->ArrayNum - i - 1) * offer_size);
+                --offers->ArrayNum;
+            }
+        }
+    }
+
     auto ec_list_done_detour(uint64 screen, uint64* done) -> void
     {
+        drop_unusable_offers(done);
         g_ec_list_done_original(screen, done);
         Output::send<LogLevel::Normal>(STR("[store] Diamond Store list {}; Elder Credit balance (local profile) {}\n"),
                                        done && reinterpret_cast<const uint8*>(done)[0x10] ? STR("received") : STR("request FAILED"), local_elder_credits());
@@ -5070,7 +5133,8 @@ namespace
 
     // FUN_1407901c0 (UHypeTitleScreen::_OnGetClaimedAssetsComplete), at login: the songs this player bought. Each
     // FAssetDetails (0x28: asset_id +0, asset_name FName +4, asset_type FString +0x10, asset_type_val +0x20) of type
-    // "Song" is installed if missing, once CelMgr has finished its own registration.
+    // "Song" is installed if missing, once CelMgr has finished its own registration. Any other asset goes to the server
+    // content sync (mp::server_content_claimed), which unlocks it once its item is registered.
     std::vector<StringType> g_claimed_pending{};
     auto claimed_done_detour(uint64 title, uint64* done) -> void
     {
@@ -5082,9 +5146,15 @@ namespace
         for (int32 i = 0; data && i < num && i < 1024; ++i)
         {
             const uint8* e = data + static_cast<size_t>(i) * 0x28;
-            if (_wcsicmp(fstring_at(e + 0x10).c_str(), L"Song") != 0) continue;
             FName name{};
             std::memcpy(&name, e + 4, sizeof(name));
+            const int type = content::unlock_type_index(fstring_at(e + 0x10));
+            if (type >= 0 && _wcsicmp(fstring_at(e + 0x10).c_str(), L"Song") != 0)
+            {
+                mp::server_content_claimed(name, static_cast<uint8>(type)); // unlocked again once its item is here
+                continue;
+            }
+            if (type < 0) continue;
             g_claimed_pending.push_back(name.ToString());
         }
         if (!g_claimed_pending.empty())
@@ -5356,11 +5426,14 @@ namespace
             const uint8 state = *static_cast<const uint8*>(parms);
             static uint64 last_fetch = 0;
             if (state == 1 || state == kFlowCheckCrateConstraints) // the flow's first stages: refresh for the next attempt
+            {
                 if (const uint64 t = GetTickCount64(); t - last_fetch > 60000)
                 {
                     last_fetch = t;
                     fetch_crate_limit(STR("entering multiplayer"));
                 }
+                mp::server_content_recheck(STR("entering multiplayer")); // items uploaded since the login
+            }
             crate_limit_on_flow_state(state);
         });
         Output::send<LogLevel::Verbose>(STR("[crate] crate song limit hooks installed (online flow state, PopupManager.QueuePopup)\n"));
@@ -5915,6 +5988,11 @@ namespace
                                                    reinterpret_cast<void**>(&g_playback_load_original), STR("shared mix playback load"));
             Output::send<LogLevel::Verbose>(STR("[mix] shared mix playback load (FUN_140658a70) hook - prepare {} install {}\n"), prep, inst);
         }
+        {
+            const auto [prep, inst] = install_hook(at(&VerifiedBuild::title_set_state), reinterpret_cast<void*>(&mp::title_set_state_detour),
+                                                   reinterpret_cast<void**>(&mp::g_title_set_state_original), STR("title screen state"));
+            Output::send<LogLevel::Verbose>(STR("[server-content] title screen state (FUN_14078d190) hook - prepare {} install {}\n"), prep, inst);
+        }
     }
 
     // Every hook's funchook page, at host_hook_start (see prepare_hook): the same function / detour pairs the
@@ -5937,6 +6015,7 @@ namespace
         prepare_hook(at(&VerifiedBuild::claimed_done), reinterpret_cast<void*>(&claimed_done_detour));
         prepare_hook(at(&VerifiedBuild::ec_purchase_request), reinterpret_cast<void*>(&ec_purchase_request_detour));
         prepare_hook(at(&VerifiedBuild::playback_load), reinterpret_cast<void*>(&playback_load_detour));
+        prepare_hook(at(&VerifiedBuild::title_set_state), reinterpret_cast<void*>(&mp::title_set_state_detour));
         int prepared = 0, in_range = 0;
         for (const auto& [address, p] : g_prepared_hooks)
         {
@@ -5951,12 +6030,44 @@ namespace
     }
 } // namespace
 
+// What host_hook.cpp shares with the DLL's other features (mp_shared.hpp)
+namespace mp
+{
+    auto supported() -> bool { return verified_build() != nullptr; }
+    auto on_game_thread() -> bool { return GetCurrentThreadId() == g_game_thread; }
+    auto api_base() -> StringType { return store_api_base(); }
+    auto session_token() -> StringType { return backend_token(); }
+    auto ini(const CharType* key, const CharType* fallback) -> StringType { return ini_value(key, fallback); }
+    auto http(const StringType& method, const StringType& url, const StringType& headers, const std::string& payload,
+              const std::filesystem::path* file_sink) -> Http
+    {
+        const HttpResult r = http_request(method, url, headers, payload, file_sink);
+        return {r.status, r.body, r.error, r.sha256, r.bytes};
+    }
+    auto file_sha256(const std::filesystem::path& path, int64* size) -> std::string { return ::file_sha256(path, size); }
+    auto mount_pak(const wchar_t* path, bool* mounted) -> bool { return ::mount_pak(path, mounted); }
+    auto unlock_mgr() -> UObject*
+    {
+        UObject* gi = game_instance();
+        auto** slot = gi ? gi->GetValuePtrByPropertyNameInChain<UObject*>(STR("theUnlockMgr")) : nullptr;
+        return slot ? *slot : nullptr;
+    }
+    auto check_sig(const std::filesystem::path& pak, const std::filesystem::path& sig, std::string* note) -> std::string
+    {
+        std::string why{};
+        if (p2p::check_song_sig(pak.wstring(), sig.wstring(), &why, p2p::kMaxContentPakBytes) == p2p::SigVerdict::Bad) return why;
+        *note = why;
+        return {};
+    }
+} // namespace mp
+
 auto host_hook_start() -> void
 {
     const std::string_view built = __DATE__ " " __TIME__;
     Output::send<LogLevel::Normal>(STR("[host] FUSERMultiplayer built {}\n"), StringType(built.begin(), built.end()));
     clean_session_songs(); // Download Songs = Temporarily: songs of runs that have exited
     prepare_all_hooks();   // now, while the memory above the exe is still free (Proton); installed later, as before
+    mp::server_content_start(); // before unreal-init: the server paks the startup registration mounts
     Hook::RegisterEngineTickPreCallback([](Hook::TCallbackIterationData<void>&, UEngine*, float, bool) {
         static uint64 tick = 0;
         g_game_thread = GetCurrentThreadId();
@@ -5995,6 +6106,7 @@ auto host_hook_start() -> void
         drive_song_transfers(); // song transfers between players
         drive_sync_notices();   // custom-song sync notices on the event highway
         drive_store_tiles();
+        mp::drive_server_content(); // server content: the login sync, its hold before the main menu, live registration
 #if FNL_DEBUG
         if (pressed('T'))
         {

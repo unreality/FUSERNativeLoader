@@ -1736,13 +1736,14 @@ namespace
     //   - the engine tick then calls the pane's own RebuildAllCollectionLists;
     //   - a native post-hook on CelMgr::Sort / SortSoftPtrs, only when called from "Get List Data for Tab Type",
     //     keeps the songs whose title or artist contains the query (case-insensitive) and that pass its filter words
-    //     (key:Am, key:C#,Eb, bpm:120, bpm:90-110, bpm:140-, bpm:-100);
+    //     (key:Am, key:C#,Eb, bpm:120, bpm:90-110, bpm:140-, bpm:-100, genre:rock, genre:pop,hiphop);
     //   - the same post-hook orders the list by key or BPM when the pane's sort method is one of ours (see "crate-edit
     //     sort" below): Get List Data clamps its in_SortBy through GetValidValue before calling the native sort, whose
     //     comparator treats anything past Year as equal, so the raw value is read from Get List Data's own frame.
     constexpr const CharType* kTextEntryClassPath = STR("/Game/UI/Shared/Widgets/WBP_Component_TextEntryBox.WBP_Component_TextEntryBox_C");
     constexpr float kSearchBoxLayout[10] = {3.0f, 0.0f, 570.0f, 66.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}; // FAnchorData: X, Y, W, H; anchors (0,0); alignment (0,0)
     constexpr auto kSearchDebounce = std::chrono::milliseconds(250);
+    constexpr int32 kSearchMaxChars = 1024; // well past any typed query
     constexpr uint8_t kSortKey = 4; // ECelSetSortMethod: Title, Artist, Genre, Year, then ours (4 is the enum's MAX,
     constexpr uint8_t kSortBpm = 5; // which the stock pane never lists)
     constexpr uint8_t kSortDescending = 1; // ESortDirection
@@ -1758,7 +1759,8 @@ namespace
         StringType text{};                         // the plain words, matched as one substring of "title\nartist"
         std::vector<std::pair<int32, int32>> keys; // (EKey, EKeyMode or -1 for either mode); empty: any
         int32 bpm_lo = -1, bpm_hi = -1;            // inclusive; -1: no bound
-        auto any() const -> bool { return !text.empty() || !keys.empty() || bpm_lo >= 0 || bpm_hi >= 0; }
+        std::vector<uint8> genres;                 // EGenre, matched against the song's Genre; empty: any
+        auto any() const -> bool { return !text.empty() || !keys.empty() || bpm_lo >= 0 || bpm_hi >= 0 || !genres.empty(); }
     };
     SearchFilter g_search_filter{};
     bool g_search_dirty = false;
@@ -1842,6 +1844,33 @@ namespace
         return true;
     }
 
+    // A lowercased genre name, ignoring - & / _ . ' (so "hip-hop", "r&b" and "latin&caribbean" work). Genre 9 is
+    // the community's Indie/Alternative (see "song genre clamp").
+    auto parse_genre(const StringType& v, uint8& genre) -> bool
+    {
+        static const std::pair<const CharType*, uint8> names[] = {
+            {STR("classical"), 1},        {STR("country"), 2},           {STR("dance"), 3},        {STR("edm"), 3},
+            {STR("electronic"), 3},       {STR("hiphop"), 4},            {STR("rap"), 4},          {STR("latin"), 5},
+            {STR("latincaribbean"), 5},   {STR("latinandcaribbean"), 5}, {STR("caribbean"), 5},    {STR("pop"), kGenrePop},
+            {STR("rnb"), 7},              {STR("rb"), 7},                {STR("randb"), 7},        {STR("rock"), 8},
+            {STR("indie"), kGenreNum},    {STR("alternative"), kGenreNum}, {STR("alt"), kGenreNum}, {STR("indiealternative"), kGenreNum},
+        };
+        StringType n{};
+        for (CharType c : v)
+        {
+            if (c != STR('-') && c != STR('&') && c != STR('/') && c != STR('_') && c != STR('.') && c != STR('\'')) n += c;
+        }
+        for (const auto& [name, value] : names)
+        {
+            if (n == name)
+            {
+                genre = value;
+                return true;
+            }
+        }
+        return false;
+    }
+
     auto parse_search(const StringType& query) -> SearchFilter
     {
         SearchFilter f{};
@@ -1872,6 +1901,19 @@ namespace
                 int32 lo = -1, hi = -1;
                 if (parse_bpm(word.substr(4), lo, hi)) f.bpm_lo = lo, f.bpm_hi = hi;
             }
+            else if (word.rfind(STR("genre:"), 0) == 0)
+            {
+                had_filter = true;
+                const StringType list = word.substr(6);
+                size_t p = 0;
+                while (p <= list.size())
+                {
+                    const size_t comma = std::min(list.find(STR(','), p), list.size());
+                    uint8 genre = 0;
+                    if (parse_genre(list.substr(p, comma - p), genre)) f.genres.push_back(genre);
+                    p = comma + 1;
+                }
+            }
             else if (!word.empty())
             {
                 if (!words.empty()) words += STR(" ");
@@ -1885,6 +1927,11 @@ namespace
     auto song_passes(UObject* song, const SearchFilter& f) -> bool
     {
         if (!f.text.empty() && song_search_text(song).find(f.text) == StringType::npos) return false;
+        if (!f.genres.empty())
+        {
+            const auto* genre = song->GetValuePtrByPropertyNameInChain<uint8>(STR("Genre"));
+            if (!genre || std::find(f.genres.begin(), f.genres.end(), *genre) == f.genres.end()) return false;
+        }
         if (f.keys.empty() && f.bpm_lo < 0 && f.bpm_hi < 0) return true;
         const SongKeyBpm k = cached_key_bpm(song);
         if (!f.keys.empty())
@@ -1965,6 +2012,11 @@ namespace
             const FText hint(STR("Search songs (key:Am bpm:90-110)"));
             PCall h(find_fn(STR("/Game/UI/Shared/Widgets/WBP_Component_TextEntryBox.WBP_Component_TextEntryBox_C:SetHintText")));
             h.copy_in(STR("in_HintText"), &hint).call(box);
+            // The class default caps entry at 16 characters. The setter pushes the cap into the inner Slate text
+            // widget without a null check, so it must run after add_child has built it (the pane's canvas is live by
+            // its Construct).
+            PCall cap(find_fn(STR("/Script/Hype.HypeEditableTextWidget:UpdateMaxCharacterLength")));
+            cap.set<int32>(STR("newLength"), kSearchMaxChars).call(box);
         }
         if (g_search_box.Get() != box)
         {
@@ -2103,9 +2155,9 @@ namespace
                 if (kept < before) songs->RemoveAt(kept, before - kept, false);
                 if (g_log_search++ < kLogLimit * 4)
                 {
-                    Output::send<LogLevel::Verbose>(STR("[FuserNative] search: {} '{}' (text '{}', {} keys, bpm {}..{}) kept {} of {}\n"), ctx.TheStack.Node()->GetName(),
-                                                    g_search_query, g_search_filter.text, g_search_filter.keys.size(), g_search_filter.bpm_lo, g_search_filter.bpm_hi, kept,
-                                                    before);
+                    Output::send<LogLevel::Verbose>(STR("[FuserNative] search: {} '{}' (text '{}', {} keys, bpm {}..{}, {} genres) kept {} of {}\n"),
+                                                    ctx.TheStack.Node()->GetName(), g_search_query, g_search_filter.text, g_search_filter.keys.size(), g_search_filter.bpm_lo,
+                                                    g_search_filter.bpm_hi, g_search_filter.genres.size(), kept, before);
                 }
             }
             if (!g_extra_sort) return;

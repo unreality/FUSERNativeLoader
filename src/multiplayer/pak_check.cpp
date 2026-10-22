@@ -284,7 +284,7 @@ namespace p2p
         }
     } // namespace
 
-    auto check_song_sig(const std::wstring& pak_path, const std::wstring& sig_path, std::string* note) -> SigVerdict
+    auto check_song_sig(const std::wstring& pak_path, const std::wstring& sig_path, std::string* note, unsigned long long max_pak_bytes) -> SigVerdict
     {
         const auto bad = [&](std::string w) {
             *note = std::move(w);
@@ -310,7 +310,7 @@ namespace p2p
             for (uint8_t b : got) hex += std::format("{:02x}", b);
             if (hex != kSigBlockSha256) return bad("the .sig has a non-standard signature block (" + hex.substr(0, 16) + ")");
         }
-        if (!read_all(pak_path, kMaxSongPakBytes, &pak) || pak.empty()) return bad("cannot read the pak");
+        if (!read_all(pak_path, max_pak_bytes, &pak) || pak.empty()) return bad("cannot read the pak");
 
         // The pak's real chunk hashes against the table (a table of the wrong length counts its missing or extra
         // entries as stale).
