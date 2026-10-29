@@ -2083,7 +2083,7 @@ namespace
     auto song_dir() -> std::filesystem::path
     {
         std::error_code ec;
-        auto dir = std::filesystem::weakly_canonical(std::filesystem::path(module_dir()) / L".." / L".." / L"Content" / L"Paks" / L"custom_songs", ec);
+        auto dir = std::filesystem::weakly_canonical(std::filesystem::path(exe_dir()) / L".." / L".." / L"Content" / L"Paks" / L"custom_songs", ec);
         return dir;
     }
 
@@ -2125,7 +2125,7 @@ namespace
         wchar_t buf[MAX_PATH]{};
         const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
         const std::filesystem::path base = n > 0 && n < MAX_PATH ? std::filesystem::path(buf) / L"Fuser" / L"Saved"
-                                                                 : std::filesystem::path(module_dir()) / L".." / L".." / L"Saved";
+                                                                 : std::filesystem::path(exe_dir()) / L".." / L".." / L"Saved";
         return base / L"FuserNative" / L"SessionSongs";
     }
     auto session_song_dir() -> std::filesystem::path { return session_songs_root() / std::to_wstring(GetCurrentProcessId()); }

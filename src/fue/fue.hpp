@@ -57,6 +57,7 @@ namespace fue
     auto build_name() -> const CharType*; // the matched kBuilds entry, e.g. "EGS v1.4.2"
     auto on_unreal_init(std::function<void()> callback) -> void;
     auto module_dir() -> std::wstring; // the folder holding winhttp.dll
+    auto exe_dir() -> std::wstring;
 
     // ------------------------------------------------------------------ memory (GMalloc) --------
     namespace FMemory

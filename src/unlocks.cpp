@@ -72,7 +72,7 @@ namespace
     {
         std::vector<StringType> names{};
         std::error_code ec{};
-        const auto dir = std::filesystem::path(module_dir()).parent_path().parent_path() / L"Content" / L"Paks" / L"custom_songs";
+        const auto dir = std::filesystem::path(exe_dir()).parent_path().parent_path() / L"Content" / L"Paks" / L"custom_songs";
         for (auto it = std::filesystem::recursive_directory_iterator(dir, ec); !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec))
         {
             if (!it->is_regular_file(ec) || it->path().extension() != L".pak") continue;

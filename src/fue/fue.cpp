@@ -429,6 +429,13 @@ namespace fue
         return std::filesystem::path(buf).parent_path().wstring();
     }
 
+    auto exe_dir() -> std::wstring
+    {
+        wchar_t buf[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, buf, MAX_PATH);
+        return std::filesystem::path(buf).parent_path().wstring();
+    }
+
     auto Output::write(LogLevel level, const StringType& text) -> void
     {
         std::lock_guard lock(g_log_mutex);

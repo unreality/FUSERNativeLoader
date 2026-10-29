@@ -569,9 +569,9 @@ void FUSER_HOOK() {
 // Custom and event songs are unlocked at runtime now (src/unlocks.cpp). The pak this loader used to
 // generate - a full DT_UnlocksSongs override - is still mounted by the engine if it is left in Content/Paks, and would
 // replace the live table with its stale copy, so it is renamed out of the way once (reversible: drop ".disabled").
-static void DisableLegacyUnlockPak(HMODULE self) {
+static void DisableLegacyUnlockPak() {
 	wchar_t buf[MAX_PATH]{};
-	GetModuleFileNameW(self, buf, MAX_PATH);
+	GetModuleFileNameW(nullptr, buf, MAX_PATH);
 	const auto paks = fs::path(buf).parent_path().parent_path().parent_path() / "Content" / "Paks";
 	for (const wchar_t* name : {L"customSongsUnlocked_P.pak", L"customSongsUnlocked_P.sig"}) {
 		std::error_code ec;
@@ -615,7 +615,7 @@ BOOL WINAPI DllMain(HMODULE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 		freopen_s(&fp, "CONOUT$", "w", stderr);
 		
 #endif
-		DisableLegacyUnlockPak(hinstDLL);
+		DisableLegacyUnlockPak();
 		FUSER_HOOK();
 		ApplyBpmPatches();
 		ApplyGenreRequestsPatch();
