@@ -37,6 +37,7 @@ logs, prefixed with its folder name.
 | `sdk=` | C++ tier only: the `FNL_SDK_VERSION` it was built with |
 | `requires=` | folder names that must load first; if one doesn't, this mod isn't loaded |
 | `after=` | folder names to load after when they load (order only) |
+| `before=` | folder names to load before when they load (order only): a mod can go ahead of one it doesn't control. An early-stage mod already loads before every game-stage one; a game-stage mod can't go before an early one (the log says so) |
 | `supersedes=` | files, relative to the game folder, renamed to `<file>.disabled` before any pak mounts (an older version's leftovers) |
 | `enabled=` | `0` leaves the mod out |
 
@@ -55,10 +56,23 @@ Lists are comma-separated; `;` or `#` starts a comment. Mods load in dependency 
 
 ## The C tier (`fnl_mod.h`)
 
-- **Patching:** patch only through `hook`, `patch` and `redirect_import`. The loader records what each change
-  overwrote, so `find_pattern` (yours and everyone's) always matches the game's code as shipped, whatever was hooked
-  first. `hook` installs a batch all or none, checks each trampoline is in jump range, and chains onto another mod's
-  hook of the same function (the log names both). A private funchook copy skips all of that.
+- **Patching:** patch only through `hook`, `hook_prepare`, `patch`, `patch_strict` and `redirect_import`. The loader
+  records what each change overwrote and who made it, so `find_pattern` (yours and everyone's) always matches the
+  game's code as shipped, whatever was hooked first, and the log warns when two owners change the same bytes. `hook`
+  installs a batch all or none, checks each trampoline is in jump range, and chains onto another mod's hook of the
+  same function. A private funchook copy (or any other hooking library) skips all of that.
+- **Flags:** a flag a loader doesn't know fails the call (`hook_prepare` returns NULL, `changed` returns
+  `FNL_CHANGED_ERROR`), so a mod built against a newer SDK finds out instead of getting the old behaviour.
+- **Hooks you can switch:** `hook_prepare` reserves a batch's trampolines now and returns a set that starts off;
+  `hook_enable(set, 1 / 0)` switches its detours on and off at any time, from any thread, without writing code (each
+  jump leads to a small loader-owned gate that checks the set's flag). Prepare from `fnl_mod_init`: memory near the exe
+  runs out as the game runs, under Proton especially. The jumps are written in `hook_prepare`, or with
+  `FNL_HOOK_INSTALL_LATER` at the first enable (a function someone hooked in between is prepared again then); each
+  `*target` becomes the trampoline when they are. A Mods tab toggle's `on_change` just calls `hook_enable`.
+- **Who changed it:** `changed(at, size, flags, owners, cap)` returns how many owners (mod folder names, `loader`,
+  `fue`) changed a byte of the range, and names them; `FNL_CHANGED_BY_OTHERS` leaves your own changes out. Check it
+  before reading values out of code you found with `find_pattern` (offsets, call targets): if someone else changed
+  it, back off. `patch_strict` is `patch` that refuses, writing nothing, when someone else changed one of the bytes.
 - **Events:** `on(FNL_EV_UNREAL_INIT | FNL_EV_FIRST_TICK | FNL_EV_TICK, ...)`, registered from `fnl_mod_init` or an
   unreal-init callback.
 - **Settings:** `add_setting` puts a toggle, dropdown or slider on the Mods tab under the mod's heading, saved as
@@ -77,7 +91,10 @@ found, then `hook` them as one batch and `redirect_import` any imports it wraps 
 ## The C++ tier
 
 Include `sdk\` and link `winhttp.lib` (from the SDK's `lib\`); put `sdk=<FNL_SDK_VERSION>` in `mod.ini`. MSVC x64,
-`/MD`, C++20 (`std::format`). The declarations marked `FNL_API` are what `winhttp.dll` exports. That library shares
+`/MD`, C++20 (`std::format`). The declarations marked `FNL_API` are the supported exports of `winhttp.dll`. It also
+exports funchook's own functions (`funchook_create`, `funchook_prepare`, ...), a side effect of the prebuilt funchook
+library it links: they are **not supported**, not declared in the SDK, and may be removed in any release without an
+`FNL_SDK_VERSION` change. Hook through `FnlApi` instead. `winhttp.lib` shares
 its name with the Windows SDK's WinHTTP import library: a mod that also calls the system's WinHTTP loads it from
 `System32` with `LoadLibraryEx` and `GetProcAddress`, as the multiplayer mod does.
 

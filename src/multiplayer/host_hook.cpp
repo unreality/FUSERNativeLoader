@@ -27,8 +27,7 @@
 #include "multiplayer/pak_check.hpp"
 #include "unlocks.hpp"
 
-#include <funchook.h>
-#include "hook_range.hpp"
+#include "fnl_mod.h"
 
 #include <bcrypt.h>
 #include <winhttp.h>
@@ -478,31 +477,31 @@ namespace
         return b ? exe_base() + b->*field : 0;
     }
 
-    // ---------------------------------------------------------------- hooks (funchook) --------------------------
-    // funchook reserves a hook's trampoline page by searching upward from the function for free memory, with no range
-    // check (hook_range.hpp). Under Proton the game's allocations fill the memory above the exe, so a page reserved
-    // once the game is running can be out of jump range (Steam Deck, 2026-10-08: the drop hooks, prepared at venue
-    // entry, got a page 2.8 GB away, and the first disc spawn jumped 4 GB too low). So every hook is prepared at
-    // host_hook_start - the first engine callback, while that memory is still free; funchook_prepare only reserves
-    // and fills the page, and later hooks reuse pages of that reservation when in range - and installed when it was
-    // before, on the game thread. A hook whose page is still out of range is never installed.
+    // ---------------------------------------------------------------- hooks (the loader's hook sets) ------------
+    // A hook's trampoline must be reserved in jump range of its function. Under Proton the game's allocations fill the
+    // memory above the exe, so one reserved once the game is running can be out of range (Steam Deck, 2026-10-08: the
+    // drop hooks, prepared at venue entry, got a page 2.8 GB away, and the first disc spawn jumped 4 GB too low). So
+    // every hook is prepared at host_hook_start - the first engine callback, while that memory is still free - as a
+    // set of its own, its jump written then and switched off; install_hook switches it on when it is wanted, on the
+    // game thread, without writing code. A hook that couldn't be prepared stays off (the loader logs why).
+    const FnlApi* g_fnl_api = nullptr;
+    FnlMod* g_fnl_self = nullptr;
     struct PreparedHook
     {
-        funchook_t* handle;
+        FnlHookSet* set;
         void* detour;
-        void* trampoline; // the original function, callable, once installed
-        int prepare;
+        void* trampoline; // the original function, callable once the jump is written
     };
-    std::unordered_map<uintptr_t, PreparedHook> g_prepared_hooks{}; // by function address; game thread only
+    std::unordered_map<uintptr_t, PreparedHook> g_prepared_hooks{}; // by function address (nodes stay put); game thread only
     auto prepare_hook(uintptr_t address, void* detour) -> void
     {
-        if (!address || g_prepared_hooks.contains(address)) return;
-        PreparedHook p{funchook_create(), detour, reinterpret_cast<void*>(address), -1};
-        if (p.handle) p.prepare = funchook_prepare(p.handle, &p.trampoline, detour);
-        g_prepared_hooks.emplace(address, p);
+        if (!address || !g_fnl_api || g_prepared_hooks.contains(address)) return;
+        PreparedHook& p = g_prepared_hooks.emplace(address, PreparedHook{nullptr, detour, reinterpret_cast<void*>(address)}).first->second;
+        const FnlHook hook{"multiplayer", &p.trampoline, detour};
+        p.set = g_fnl_api->hook_prepare(g_fnl_self, &hook, 1, 0);
     }
-    // Installs the hook on address (prepared at startup, or now) and sets *original. Returns {prepare, install};
-    // install is -2 when funchook's page is out of jump range (the hook stays off and the error is logged).
+    // Switches the hook on address on (prepared at startup, or now) and sets *original. Returns {prepare, install}:
+    // 0 each for success, -1 for a failure (the hook stays off).
     auto install_hook(uintptr_t address, void* detour, void** original, const CharType* what) -> std::pair<int, int>
     {
         prepare_hook(address, detour);
@@ -514,18 +513,9 @@ namespace
             Output::send<LogLevel::Error>(STR("[host] hook {}: prepared for another detour - not installed\n"), what);
             return {-1, -1};
         }
-        if (p.prepare != 0) return {p.prepare, -1};
-        if (!hook_in_range(reinterpret_cast<void*>(address), p.trampoline))
-        {
-            Output::send<LogLevel::Error>(STR("[host] hook {}: funchook's trampoline {} is out of jump range of {} - not installed\n"), what, p.trampoline,
-                                          reinterpret_cast<void*>(address));
-            funchook_destroy(p.handle);
-            p.prepare = -2; // asking again gives the same answer
-            return {0, -2};
-        }
-        const int inst = funchook_install(p.handle, 0);
-        if (inst == 0) *original = p.trampoline;
-        return {0, inst};
+        if (!p.set) return {-1, -1};
+        *original = p.trampoline; // before the detour can run: it calls through it
+        return {0, g_fnl_api->hook_enable(g_fnl_self, p.set, 1) ? 0 : -1};
     }
 
     // ---------------------------------------------------------------- gameplay flow ----------------------------
@@ -6086,7 +6076,7 @@ namespace
         }
     }
 
-    // Every hook's funchook page, at host_hook_start (see prepare_hook): the same function / detour pairs the
+    // Every hook prepared at host_hook_start (see prepare_hook): the same function / detour pairs the
     // install_* functions above install, whether or not they ever do (the leave trace's are off by default). The
     // trace hooks exist in debug builds only.
     auto prepare_all_hooks() -> void
@@ -6107,17 +6097,12 @@ namespace
         prepare_hook(at(&VerifiedBuild::ec_purchase_request), reinterpret_cast<void*>(&ec_purchase_request_detour));
         prepare_hook(at(&VerifiedBuild::playback_load), reinterpret_cast<void*>(&playback_load_detour));
         prepare_hook(at(&VerifiedBuild::title_set_state), reinterpret_cast<void*>(&mp::title_set_state_detour));
-        int prepared = 0, in_range = 0;
-        for (const auto& [address, p] : g_prepared_hooks)
-        {
-            prepared += p.prepare == 0;
-            in_range += p.prepare == 0 && hook_in_range(reinterpret_cast<void*>(address), p.trampoline);
-        }
-        if (in_range == prepared)
+        size_t prepared = 0;
+        for (const auto& [address, p] : g_prepared_hooks) prepared += p.set != nullptr;
+        if (prepared == g_prepared_hooks.size())
             Output::send<LogLevel::Normal>(STR("[host] hooks: {} of {} prepared, all in jump range\n"), prepared, g_prepared_hooks.size());
         else
-            Output::send<LogLevel::Error>(STR("[host] hooks: {} of {} prepared, only {} in jump range - the others stay off\n"), prepared,
-                                          g_prepared_hooks.size(), in_range);
+            Output::send<LogLevel::Error>(STR("[host] hooks: {} of {} prepared - the others stay off\n"), prepared, g_prepared_hooks.size());
     }
 } // namespace
 
@@ -6152,8 +6137,10 @@ namespace mp
     }
 } // namespace mp
 
-auto host_hook_start() -> void
+auto host_hook_start(const FnlApi* api, FnlMod* self) -> void
 {
+    g_fnl_api = api;
+    g_fnl_self = self;
     const std::string_view built = __DATE__ " " __TIME__;
     Output::send<LogLevel::Normal>(STR("[host] FUSERMultiplayer built {}\n"), StringType(built.begin(), built.end()));
     clean_session_songs(); // Download Songs = Temporarily: songs of runs that have exited

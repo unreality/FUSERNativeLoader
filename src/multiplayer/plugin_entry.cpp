@@ -6,7 +6,7 @@
 
 #include "fnl_mod.h"
 
-auto host_hook_start() -> void;
+auto host_hook_start(const FnlApi* api, FnlMod* self) -> void;
 
 namespace
 {
@@ -68,10 +68,10 @@ namespace
 
 extern "C" FNL_MOD_EXPORT int fnl_mod_init(const FnlApi* api, FnlMod* self)
 {
-    if (!api || api->abi < FNL_MOD_ABI || !FNL_API_HAS(api, enable_setting)) return FNL_FAILED;
+    if (!api || api->abi < FNL_MOD_ABI || !FNL_API_HAS(api, patch_strict)) return FNL_FAILED;
     g_api = api;
     g_self = self;
     register_settings();
-    host_hook_start();
+    host_hook_start(api, self);
     return FNL_OK;
 }

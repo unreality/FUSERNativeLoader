@@ -66,7 +66,7 @@ add_library(FUSERMultiplayer SHARED
 )
 fnl_mod(FUSERMultiplayer)
 # libarchive + zlib (static, tools/build_libarchive.ps1): extracting community song archives
-target_link_libraries(FUSERMultiplayer PRIVATE FUSERNativeLoader "${CMAKE_CURRENT_SOURCE_DIR}/lib/funchook.lib"
+target_link_libraries(FUSERMultiplayer PRIVATE FUSERNativeLoader
     "${CMAKE_CURRENT_SOURCE_DIR}/lib/libarchive/archive.lib" "${CMAKE_CURRENT_SOURCE_DIR}/lib/libarchive/zlib.lib" Bcrypt)
 
 # Key/BPM, song tabs, search, sorting, crate-edit tabs, new-crate slots, genre 9 requests (C++ tier)
@@ -74,11 +74,11 @@ add_library(FUSERQualityOfLifeImprovements SHARED src/qol/plugin_entry.cpp src/q
 fnl_mod(FUSERQualityOfLifeImprovements)
 target_link_libraries(FUSERQualityOfLifeImprovements PRIVATE FUSERNativeLoader)
 
-# The fifth deck and Hot Clip Volume Normalisation (C++ tier; its hooks are prepared early and installed later, on its
-# own funchook handle)
+# The fifth deck and Hot Clip Volume Normalisation (C++ tier; its hooks are prepared early and installed later, as
+# FnlApi hook sets)
 add_library(FUSERFifthDeck SHARED src/fifth_deck/plugin_entry.cpp src/fifth_deck/fifth_deck.cpp)
 fnl_mod(FUSERFifthDeck)
-target_link_libraries(FUSERFifthDeck PRIVATE FUSERNativeLoader "${CMAKE_CURRENT_SOURCE_DIR}/lib/funchook.lib")
+target_link_libraries(FUSERFifthDeck PRIVATE FUSERNativeLoader)
 
 # The BPM range (C tier, early) and the engine / SDK fixes (C tier)
 add_library(FUSERBpmRange SHARED src/bpm_range/bpm_range.cpp)

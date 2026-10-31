@@ -9,6 +9,7 @@
 //   sdk=         C++ tier only: must equal FNL_SDK_VERSION; C++ tier mods are game-stage only
 //   requires=    folder names that must load first; one missing, disabled or not loaded skips this mod
 //   after=       folder names to load after when they load (order only)
+//   before=      folder names to load before when they load (order only; an early mod can't wait for a game-stage one)
 //   supersedes=  files, relative to the game root, renamed to <file>.disabled before any pak is mounted
 //   enabled=     0 leaves the mod out (so does a folder name ending in .disabled)
 // Lists are comma-separated. Mods load in dependency order, then by folder name.
@@ -51,7 +52,7 @@ struct FnlMod
     StringType name, version, dll;
     bool early = false;
     bool cpp = false;    // sdk= given: the C++ tier
-    std::vector<StringType> needs, after, supersedes;
+    std::vector<StringType> needs, after, before, supersedes;
     StringType problem;  // why it won't load; empty when it will
     State state = State::Pending;
 };
@@ -125,6 +126,42 @@ namespace
     auto api_redirect_import(FnlMod* self, const char* dll, const char* function, void* replacement, void** original) -> int
     {
         return self && code_redirect_import(self->owner.c_str(), dll, function, replacement, original) ? 1 : 0;
+    }
+
+    auto api_hook_prepare(FnlMod* self, const FnlHook* hooks, size_t count, uint32_t flags) -> FnlHookSet*
+    {
+        return self ? reinterpret_cast<FnlHookSet*>(code_hook_prepare(self->owner.c_str(), hooks, count, flags)) : nullptr;
+    }
+
+    auto api_hook_enable(FnlMod* self, FnlHookSet* set, int enabled) -> int
+    {
+        return self && code_hook_enable(self->owner.c_str(), reinterpret_cast<CodeHookSet*>(set), enabled != 0) ? 1 : 0;
+    }
+
+    auto api_changed(FnlMod* self, const void* at, size_t size, uint32_t flags, char* owners, size_t cap) -> size_t
+    {
+        if (flags & ~static_cast<uint32_t>(FNL_CHANGED_BY_OTHERS))
+        {
+            // a flag from a newer SDK: refused, so the mod can't mistake the answer for one that honoured it
+            api_log(self, FNL_LOG_ERROR, std::format(STR("changed: unknown flags 0x{:X}"), flags).c_str());
+            if (owners && cap) owners[0] = '\0';
+            return FNL_CHANGED_ERROR;
+        }
+        std::string names{};
+        const char* skip = self && (flags & FNL_CHANGED_BY_OTHERS) ? self->owner.c_str() : nullptr;
+        const size_t n = code_changed(skip, at, size, owners ? &names : nullptr);
+        if (owners && cap)
+        {
+            const size_t k = std::min(names.size(), cap - 1);
+            std::copy_n(names.begin(), k, owners);
+            owners[k] = '\0';
+        }
+        return n;
+    }
+
+    auto api_patch_strict(FnlMod* self, void* at, const void* bytes, size_t count) -> int
+    {
+        return self && code_patch(self->owner.c_str(), at, bytes, count, true) ? 1 : 0;
     }
 
     auto api_on(FnlMod* self, FnlEvent event, void (*cb)(void* ctx, const void* arg), void* ctx) -> void
@@ -254,6 +291,10 @@ namespace
         g_api.enable_setting = &api_enable_setting;
         g_api.provide_interface = &api_provide_interface;
         g_api.find_interface = &api_find_interface;
+        g_api.hook_prepare = &api_hook_prepare;
+        g_api.hook_enable = &api_hook_enable;
+        g_api.changed = &api_changed;
+        g_api.patch_strict = &api_patch_strict;
     }
 
     // ---------------------------------------------------------------- manifests -----------------------------------
@@ -309,6 +350,7 @@ namespace
         m->dll = get(STR("dll"));
         m->needs = split_list(get(STR("requires")));
         m->after = split_list(get(STR("after")));
+        m->before = split_list(get(STR("before")));
         m->supersedes = split_list(get(STR("supersedes")));
         const StringType stage = lower(get(STR("stage")));
         m->early = stage == STR("early");
@@ -357,7 +399,7 @@ namespace
         }
     }
 
-    // The mods without a problem, in dependency order (requires= and after=, then folder name). A mod whose requires=
+    // The mods without a problem, in dependency order (requires=, after= and before=, then folder name). A mod whose requires=
     // can't be met, an early mod requiring a game-stage one, or a cycle gets a problem instead.
     auto resolve_order() -> void
     {
@@ -396,6 +438,15 @@ namespace
                 FnlMod* dep = find_mod(id);
                 if (dep && dep->problem.empty() && dep != m.get() && !(m->early && !dep->early)) waits[m.get()].insert(dep); // a game-stage one loads later anyway
             }
+            for (const StringType& id : m->before)
+            {
+                FnlMod* later = find_mod(id);
+                if (!later || !later->problem.empty() || later == m.get()) continue;
+                if (m->early == later->early)
+                    waits[later].insert(m.get());
+                else if (later->early) // an early-stage mod loads before every game-stage one
+                    Output::send<LogLevel::Warning>(STR("[mods] {}: before={} ignored - {} is early-stage, this mod game-stage\n"), m->id, id, later->id);
+            }
         }
         while (!waits.empty())
         {
@@ -407,7 +458,7 @@ namespace
             waits.erase(next);
             for (auto& [m, deps] : waits) deps.erase(next);
         }
-        for (auto& [m, deps] : waits) m->problem = STR("its requires= / after= form a cycle");
+        for (auto& [m, deps] : waits) m->problem = STR("its requires= / after= / before= form a cycle");
         // early mods first: they load inside DllMain, the rest at the first engine callback
         std::stable_partition(g_order.begin(), g_order.end(), [](FnlMod* m) { return m->early; });
     }

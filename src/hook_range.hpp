@@ -1,5 +1,5 @@
 #pragma once
-// Whether a funchook hook can be installed safely (shared by winhttp.dll and FUSERMultiplayer.dll; C++17).
+// Whether a funchook hook can be installed safely (code_patch.cpp, for every hook made through the loader; C++17).
 //
 // funchook joins a hooked function to its trampoline page with a jmp rel32, which reaches +/-2 GB. It reserves that
 // page by searching upward from the function for free memory, and range-checks only a page it reuses, never one it

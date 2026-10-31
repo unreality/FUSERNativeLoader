@@ -36,8 +36,6 @@
 #include <Windows.h>
 
 #include "fue/fue.hpp"
-#include "hook_range.hpp"
-#include <funchook.h>
 #include <intrin.h>
 
 #include <algorithm>
@@ -1428,7 +1426,9 @@ namespace
     AnySoloFn g_any_solo = nullptr;
     ApplyFn g_apply = nullptr;
     CopySoloMuteFn g_copy_solo_mute = nullptr;
-    funchook_t* g_hooks = nullptr;
+    const FnlApi* g_api = nullptr;
+    FnlMod* g_self = nullptr;
+    FnlHookSet* g_hooks = nullptr; // the loader's hook set, prepared at the start
     bool g_hooks_installed = false;
 
     // UDeckState's FDeckMuteSoloState entries { isMutePressed, isSoloPressed }, if they reach track 17
@@ -2417,7 +2417,7 @@ namespace
 
     AuditionSetFn g_audition_set = nullptr;
     int32* g_audition_mode = nullptr;
-    funchook_t* g_clip_hooks = nullptr;
+    FnlHookSet* g_clip_hooks = nullptr;
     bool g_clip_volume = false; // the Settings screen's Hot Clip Volume Normalisation toggle
 
     // The mode's address, from its setter FUN_1405a1b80: mov [rip+rel32], ecx; ret
@@ -2443,12 +2443,10 @@ namespace
     {
         g_audition_set = reinterpret_cast<AuditionSetFn>(exe_at(g_addrs->audition_set));
         void* function = reinterpret_cast<void*>(g_audition_set);
-        g_clip_hooks = funchook_create();
-        const int prep = g_clip_hooks ? funchook_prepare(g_clip_hooks, reinterpret_cast<void**>(&g_audition_set), reinterpret_cast<void*>(&audition_set_detour)) : -1;
-        if (prep == 0 && hook_in_range(function, reinterpret_cast<void*>(g_audition_set))) return;
-        Output::send<LogLevel::Error>(STR("[5deck] Hot Clip volume hook: prepare {} at {} failed or out of range - no Hot Clip Volume Normalisation\n"), prep, function);
-        if (g_clip_hooks) funchook_destroy(g_clip_hooks);
-        g_clip_hooks = nullptr;
+        const FnlHook hook{"audition set", reinterpret_cast<void**>(&g_audition_set), reinterpret_cast<void*>(&audition_set_detour)};
+        g_clip_hooks = g_api->hook_prepare(g_self, &hook, 1, FNL_HOOK_INSTALL_LATER);
+        if (!g_clip_hooks)
+            Output::send<LogLevel::Error>(STR("[5deck] Hot Clip volume hook at {}: not prepared - no Hot Clip Volume Normalisation\n"), function);
     }
 
     auto install_clip_hook() -> void
@@ -2462,12 +2460,12 @@ namespace
             Output::send<LogLevel::Warning>(STR("[5deck] audition event mode not found: a song audition still leaves Hot Clips on the preview event\n"));
             return;
         }
-        Output::send<LogLevel::Normal>(STR("[5deck] Hot Clip volume hook: install {}\n"), funchook_install(g_clip_hooks, 0));
+        Output::send<LogLevel::Normal>(STR("[5deck] Hot Clip volume hook: install {}\n"), g_api->hook_enable(g_self, g_clip_hooks, 1) ? 0 : -1);
     }
 
     // ---------------------------------------------------------------- hooks -------------------------
-    // Prepared at the mod's start, the first engine callback (funchook reserves its trampoline page near the exe while
-    // that memory is still free, see hook_range.hpp), installed with the first fifth deck.
+    // Prepared at the mod's start, the first engine callback (the loader reserves each trampoline near the exe while
+    // that memory is still free), as one hook set installed and switched on with the first fifth deck.
     auto prepare_hooks() -> void
     {
         const CharType* build = build_name();
@@ -2502,7 +2500,6 @@ namespace
         g_voice_callback = reinterpret_cast<VoiceCallbackFn>(exe_at(g_addrs->voice_callback));
         g_track_volume = reinterpret_cast<VolumeFn>(exe_at(g_addrs->track_volume));
         g_play_params = reinterpret_cast<PlayParamsFn>(exe_at(g_addrs->play_params));
-        g_hooks = funchook_create();
         const struct
         {
             void** target;
@@ -2530,18 +2527,10 @@ namespace
                      {reinterpret_cast<void**>(&g_voice_callback), reinterpret_cast<void*>(&voice_callback_detour)},
                      {reinterpret_cast<void**>(&g_track_volume), reinterpret_cast<void*>(&track_volume_detour)},
                      {reinterpret_cast<void**>(&g_play_params), reinterpret_cast<void*>(&play_params_detour)}};
-        for (const auto& h : hooks)
-        {
-            void* function = *h.target;
-            const int prep = g_hooks ? funchook_prepare(g_hooks, h.target, h.detour) : -1;
-            if (prep != 0 || !hook_in_range(function, *h.target))
-            {
-                Output::send<LogLevel::Error>(STR("[5deck] hooks: prepare {} at {} failed or out of range - no fifth deck\n"), prep, function);
-                if (g_hooks) funchook_destroy(g_hooks);
-                g_hooks = nullptr;
-                return;
-            }
-        }
+        FnlHook set[std::size(hooks)]{};
+        for (size_t i = 0; i < std::size(hooks); ++i) set[i] = {"fifth deck", hooks[i].target, hooks[i].detour};
+        g_hooks = g_api->hook_prepare(g_self, set, std::size(set), FNL_HOOK_INSTALL_LATER);
+        if (!g_hooks) Output::send<LogLevel::Error>(STR("[5deck] hooks: not prepared - no fifth deck\n"));
     }
 
     auto install_hooks() -> void
@@ -2549,8 +2538,8 @@ namespace
         static bool tried = false;
         if (tried || !g_hooks) return;
         tried = true;
-        const int inst = funchook_install(g_hooks, 0);
-        g_hooks_installed = inst == 0;
+        g_hooks_installed = g_api->hook_enable(g_self, g_hooks, 1) != 0;
+        const int inst = g_hooks_installed ? 0 : -1;
         Output::send<LogLevel::Normal>(STR("[5deck] hooks (solo / mute, queue drop, transitions, stage gains, track 17's audio and strip, track 18's riser): install {}\n"), inst);
     }
 
@@ -3047,8 +3036,6 @@ namespace
 
     // The two toggles on the Settings screen's Mods tab, under this mod's heading, each on a build its hooks are
     // prepared for
-    const FnlApi* g_api = nullptr;
-    FnlMod* g_self = nullptr;
 
     auto register_settings() -> void
     {

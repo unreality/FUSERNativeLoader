@@ -13,8 +13,8 @@
 // It returns FNL_OK, FNL_UNSUPPORTED (nothing to do here, e.g. an unknown build) or FNL_FAILED.
 //
 // FnlApi only grows: a field exists when api->size covers it (FNL_API_HAS). Every string is NUL-terminated. Code is
-// patched only through hook / patch / redirect_import, so later find_pattern calls (the loader's and every mod's)
-// still see the game's code as shipped.
+// patched only through hook / hook_prepare / patch / patch_strict / redirect_import, so later find_pattern calls (the
+// loader's and every mod's) still see the game's code as shipped, and changed() knows who changed what.
 #include <stddef.h>
 #include <stdint.h>
 
@@ -66,6 +66,17 @@ typedef struct FnlHook {
     void* detour;
 } FnlHook;
 
+typedef struct FnlHookSet FnlHookSet; // hooks prepared together by hook_prepare, switched on and off together
+
+// hook_prepare flags
+#define FNL_HOOK_INSTALL_LATER 1 // write the jumps at the set's first enable instead of in hook_prepare
+
+// changed flags
+#define FNL_CHANGED_BY_OTHERS 1  // leave the calling mod's own changes out
+
+// changed: the flags held a bit this loader doesn't know (one from a newer SDK)
+#define FNL_CHANGED_ERROR ((size_t)-1)
+
 typedef enum FnlSettingKind {
     FNL_SETTING_TOGGLE = 1,  // stored 1 / 0
     FNL_SETTING_CHOICE = 2,  // a dropdown; stored: the entry's index, or its choice_values entry
@@ -114,7 +125,8 @@ typedef struct FnlApi {
     // again (the detours chain, in install order) and the log names both.
     int (*hook)(FnlMod* self, const FnlHook* hooks, size_t count);
 
-    // Writes bytes over the game's code (any protection), recording what was there. Nonzero on success.
+    // Writes bytes over the game's code (any protection), recording what was there. Nonzero on success. The log warns
+    // when another mod (or the loader) changed any of those bytes already; patch_strict refuses instead.
     int (*patch)(FnlMod* self, void* at, const void* bytes, size_t count);
 
     // Points the game exe's import of function from dll (a case-insensitive prefix such as "api-ms-win-crt-runtime";
@@ -153,6 +165,33 @@ typedef struct FnlApi {
     // A provided table whose version is at least min_version, or NULL (not provided, or older). From fnl_mod_init when
     // the provider loads first (requires= or after= it), otherwise from an FNL_EV_UNREAL_INIT callback.
     const void* (*find_interface)(FnlMod* self, const char* name, uint32_t min_version);
+
+    // Prepares every hook in hooks[], or none, as one set that starts switched off; NULL on failure. Each trampoline
+    // is reserved here, in jump range of its function, so prepare from fnl_mod_init: memory near the exe runs out as
+    // the game runs (under Proton especially). While the set is off, each function runs as shipped; while it is on,
+    // its detour runs. The jumps are written here, or at the first hook_enable with FNL_HOOK_INSTALL_LATER, and
+    // never again: hook_enable only flips a flag, so a Mods tab toggle never rewrites running code. Each *target
+    // becomes the trampoline when the jumps are written (until then it is still the function). With
+    // FNL_HOOK_INSTALL_LATER, a function changed by someone else in between is prepared again at that enable, which
+    // fails if its new trampoline is out of jump range. Hooks on a function another mod hooked chain, as with hook.
+    // A flag this loader doesn't know (one from a newer SDK) fails the call: NULL, nothing prepared.
+    FnlHookSet* (*hook_prepare)(FnlMod* self, const FnlHook* hooks, size_t count, uint32_t flags);
+
+    // Switches a set's detours on (enabled nonzero) or off, from any thread; a call already inside a detour finishes
+    // there. Nonzero on success; zero when the set isn't this mod's or its jumps couldn't be written (it stays off).
+    int (*hook_enable)(FnlMod* self, FnlHookSet* set, int enabled);
+
+    // How many owners (mod folder names, or the loader's "loader" and "fue") have changed a byte of [at, at + size)
+    // through this API: hooks, patches, import slots; 0 for none. FNL_CHANGED_BY_OTHERS leaves this mod out. owners,
+    // when not NULL, gets their names, comma-separated, in the order they first changed the range (truncated to
+    // cap - 1 characters, NUL-terminated). A hook counts from when its jumps are written, as the bytes they
+    // overwrote. Changes made outside this API (another hooking library, a private funchook copy) aren't known. A flag
+    // this loader doesn't know (one from a newer SDK) returns FNL_CHANGED_ERROR, with owners empty.
+    size_t (*changed)(FnlMod* self, const void* at, size_t size, uint32_t flags, char* owners, size_t cap);
+
+    // patch, only over bytes no one else has changed: zero, and nothing written, when changed() with
+    // FNL_CHANGED_BY_OTHERS finds anything in the range. The mod's own earlier changes don't count.
+    int (*patch_strict)(FnlMod* self, void* at, const void* bytes, size_t count);
 } FnlApi;
 
 #define FNL_API_HAS(api, field) ((api)->size >= offsetof(FnlApi, field) + sizeof(((FnlApi*)0)->field))
