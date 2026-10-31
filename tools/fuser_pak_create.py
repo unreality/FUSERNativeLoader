@@ -6,7 +6,7 @@ Companion to fuser_pak_extract.py. Builds a plain, unencrypted UE4 pak format
 version 8 file (FNameBasedCompressionMethod, no compression, no encryption) -
 the exact shape already confirmed to be accepted by the game for override
 content (matching the community FuserSongLoader tool's customSongsUnlocked_P.pak).
-FUSERNativeLoader's build.ps1 uses it to pack FUSERNativeMods_P.pak.
+FUSERNativeLoader's build.ps1 uses it to pack each bundled mod's pak (<Mod>_P.pak).
 
 Usage:
     python fuser_pak_create.py <output.pak> --mount <mount_point> [--root <dir>] <file1> [<file2> ...]

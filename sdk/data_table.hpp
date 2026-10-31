@@ -17,12 +17,12 @@ namespace data_table
     {
         UFunction* fn;
         std::vector<uint8> buf;
-        explicit Call(UFunction* f);
-        ~Call();
+        FNL_API explicit Call(UFunction* f);
+        FNL_API ~Call();
         Call(const Call&) = delete;
         Call& operator=(const Call&) = delete;
-        auto prop(const CharType* n) -> FProperty*;
-        auto addr(const CharType* n) -> uint8*;
+        FNL_API auto prop(const CharType* n) -> FProperty*;
+        FNL_API auto addr(const CharType* n) -> uint8*;
 
       private:
         template <typename F>
@@ -37,10 +37,10 @@ namespace data_table
     };
 
     // path -> FSoftObjectPath -> TSoftObjectPtr -> LoadSynchronous, all through KismetSystemLibrary
-    auto load_blocking(const CharType* path) -> UObject*;
+    FNL_API auto load_blocking(const CharType* path) -> UObject*;
 
     // True when p lies in the game exe's image (a vtable slot that still points where 4.24 puts it)
-    auto in_exe(const void* p) -> bool;
+    FNL_API auto in_exe(const void* p) -> bool;
 
     // A TSet's live elements, `stride` bytes apart: the sparse array's TArray @0 (Num @8), its allocation bits inline
     // @0x10 or at the pointer @0x20. f(uint8* element) is called for each allocated slot.
@@ -57,7 +57,7 @@ namespace data_table
     }
 
     // The table's row struct (nullptr when `table` is not a plain UDataTable)
-    auto row_struct(UObject* table) -> UStruct*;
+    FNL_API auto row_struct(UObject* table) -> UStruct*;
 
     // RowMap elements are TPair<FName, uint8*> plus the set's hash links: 0x18 bytes
     template <typename F>
@@ -67,15 +67,15 @@ namespace data_table
                          [&](uint8* e) { f(*reinterpret_cast<FName*>(e), *reinterpret_cast<uint8**>(e + 8)); });
     }
 
-    auto find_row(UObject* table, const FName& name) -> uint8*;
-    auto row_count(UObject* table) -> int32;
+    FNL_API auto find_row(UObject* table, const FName& name) -> uint8*;
+    FNL_API auto row_count(UObject* table) -> int32;
 
     // True when the table's UDataTable::AddRow vtable slot points into the exe, where 4.24 puts it
-    auto can_add_rows(UObject* table) -> bool;
+    FNL_API auto can_add_rows(UObject* table) -> bool;
 
     // UDataTable::AddRow(name, *tmpl): the engine copies the template row into a new allocation under `name`.
     // Returns the new row, or nullptr (AddRow not where 4.24 puts it, or the row did not appear).
-    auto add_row(UObject* table, const FName& name, const uint8* tmpl) -> uint8*;
+    FNL_API auto add_row(UObject* table, const FName& name, const uint8* tmpl) -> uint8*;
 
     // ------------------------------------------------------------------ maps keyed by FName ----------------
     // The managers keep what they read from their tables in TMap<FName, V>s, built once. An item added after that
@@ -87,15 +87,15 @@ namespace data_table
     // HashIndex in its last 8 bytes; `stride` is its size.
 
     // GetTypeHash(FName) as the exe computes it: the number plus a mix of the comparison index.
-    auto fname_hash(const FName& name) -> uint32;
+    FNL_API auto fname_hash(const FName& name) -> uint32;
 
     // The element holding key, or nullptr.
-    auto fname_map_find(const void* map, size_t stride, const FName& key) -> uint8*;
+    FNL_API auto fname_map_find(const void* map, size_t stride, const FName& key) -> uint8*;
 
     // Adds key to the map and returns the new element's value storage (8 bytes after the element's start), after
     // `init(value)` has constructed the value in it. nullptr (nothing changed) when the key is already there, or
     // when the map's existing hash links don't follow fname_hash (a layout this code doesn't know); why says which.
-    auto fname_map_add(void* map, size_t stride, const FName& key, const std::function<void(uint8* value)>& init,
+    FNL_API auto fname_map_add(void* map, size_t stride, const FName& key, const std::function<void(uint8* value)>& init,
                        StringType* why) -> uint8*;
 
     // A map's element size for values of `value_size` bytes (the pair rounded to 8, plus the two hash links).
@@ -103,5 +103,5 @@ namespace data_table
 
     // A struct value constructed in zeroed `dst` and copied from `src` property by property (the bytes before its
     // first property - FTableRowBase's vtable - copied as they are).
-    auto copy_struct(UStruct* st, uint8* dst, const uint8* src) -> void;
+    FNL_API auto copy_struct(UStruct* st, uint8* dst, const uint8* src) -> void;
 } // namespace data_table

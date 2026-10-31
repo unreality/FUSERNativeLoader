@@ -1,7 +1,7 @@
 # Known game binaries
 
 The FUSER shipping executables the loader supports (fue's `kBuilds`, host_hook's `kVerified`). They are kept here as
-references for deriving addresses (`tools/derive_mp_build.py`), disassembly and crash-dump triage. They are
+references for deriving addresses (`tools/derive_mp_build.py`, `tools/derive_fifth_deck_build.py`), disassembly and crash-dump triage. They are
 copyrighted game files and are git-ignored (`.gitignore`: `binaries/**/*.exe`); only this README is tracked.
 
 | Folder | Build | Engine CL | TimeDateStamp | SizeOfImage | SHA-256 |

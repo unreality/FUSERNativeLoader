@@ -17,6 +17,7 @@
 #include <Windows.h>
 
 #include "data_table.hpp"
+#include "unlocks.hpp"
 
 #include <filesystem>
 

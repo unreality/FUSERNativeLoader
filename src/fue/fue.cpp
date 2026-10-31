@@ -3,10 +3,12 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
-#include "fue.hpp"
+#include "fue/fue.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cwchar>
 #include <filesystem>
 #include <array>
 #include <mutex>
@@ -14,11 +16,8 @@
 #include <utility>
 #include <unordered_map>
 
-#include <funchook.h>
-
-#include "hook_range.hpp"
-
-auto fnl_load_optional_multiplayer() -> void;
+#include "loader/code_patch.hpp"
+#include "loader/mod_manager.hpp"
 
 namespace fue
 {
@@ -214,15 +213,20 @@ namespace fue
             {
                 g_ready = false; // fue's API goes inert; the detours only pass through
                 Output::send<LogLevel::Error>(STR("[fue] {}: the build entry does not fit this exe - FuserNative features are disabled\n"), when);
+                fnl_mods_game_stage(false);
                 return;
             }
+            fnl_mods_game_stage(g_ready); // their unreal-init callbacks run below, after the loader's
             Output::send<LogLevel::Verbose>(STR("[fue] {}: {} objects, thread {}, running {} init callbacks\n"), when, num_objects(), GetCurrentThreadId(), g_unreal_init.size());
-            for (auto& cb : g_unreal_init) cb();
+            for (size_t i = 0; i < g_unreal_init.size(); ++i)
+            {
+                const auto cb = g_unreal_init[i]; // a copy: a callback may register another, which then runs in this pass
+                cb();
+            }
         }
 
         auto process_event_detour(UObject* self, UFunction* fn, void* parms) -> void
         {
-            fnl_load_optional_multiplayer();
             // UE4SS's on_unreal_init equivalent: the first ProcessEvent (the object system is up, and it comes before
             // the shell creates its screens - at the first GameEngine::Tick, WBP_Screen_Settings / _CrateEdit had
             // already been initialized)
@@ -235,29 +239,16 @@ namespace fue
 
         auto engine_tick_detour(UEngine* self, float delta, bool idle) -> void
         {
-            fnl_load_optional_multiplayer();
             if (!g_unreal_init_done) run_unreal_init(STR("first GameEngine::Tick"));
             Hook::TCallbackIterationData<void> data{};
             for (auto& cb : g_tick_pre) cb(data, self, delta, idle);
             g_engine_tick_original(self, delta, idle);
         }
 
-        auto install_hook(void** target, void* hook, const CharType* what) -> bool
+        auto install_hook(void** target, void* hook, const char* what) -> bool
         {
-            funchook_t* h = funchook_create();
-            if (!h) return false;
-            void* const function = *target;
-            const int prep = funchook_prepare(h, target, hook);
-            if (prep == 0 && !hook_in_range(function, *target))
-            {
-                Output::send<LogLevel::Error>(STR("[fue] hook {}: funchook's trampoline {} is out of jump range of {} - not installed\n"), what, *target, function);
-                funchook_destroy(h);
-                *target = function;
-                return false;
-            }
-            const int inst = prep == 0 ? funchook_install(h, 0) : -1;
-            Output::send<LogLevel::Verbose>(STR("[fue] hook {}: prepare {} install {}\n"), what, prep, inst);
-            return prep == 0 && inst == 0;
+            const FnlHook request{what, target, hook};
+            return code_hook("fue", &request, 1);
         }
 
         // ---------------------------------------------------------------- native UFunction hooks -
@@ -410,6 +401,19 @@ namespace fue
         }
 
         std::unordered_map<StringType, FWeakObjectPtr> g_find_cache{};
+
+        // A class whose package is in the custom songs' folders. Song packages define no classes (the multiplayer
+        // extension's check_song_pak refuses any that do), so such a class came from a pak that was never checked;
+        // it may share its short name with a game class to be found in that class's place.
+        auto song_folder_class(const UClass* cls) -> bool
+        {
+            const UObject* package = cls;
+            while (package->GetOuterPrivate()) package = package->GetOuterPrivate();
+            const StringType name = package->GetName();
+            for (const CharType* root : {STR("/Game/Audio/Songs/"), STR("/Game/DLC/Songs/"), STR("/Game/UI/AlbumArt/")})
+                if (_wcsnicmp(name.c_str(), root, wcslen(root)) == 0) return true;
+            return false;
+        }
     } // namespace
 
     // -------------------------------------------------------------------- lifecycle ---------------
@@ -495,8 +499,8 @@ namespace fue
         g_natives = reinterpret_cast<NativeFn*>(g_base + g_build->natives);
         g_process_event_original = reinterpret_cast<ProcessEventFn>(g_base + g_build->process_event);
         g_engine_tick_original = reinterpret_cast<EngineTickFn>(g_base + g_build->engine_tick);
-        const bool pe = install_hook(reinterpret_cast<void**>(&g_process_event_original), reinterpret_cast<void*>(&process_event_detour), STR("UObject::ProcessEvent"));
-        const bool tick = install_hook(reinterpret_cast<void**>(&g_engine_tick_original), reinterpret_cast<void*>(&engine_tick_detour), STR("UGameEngine::Tick"));
+        const bool pe = install_hook(reinterpret_cast<void**>(&g_process_event_original), reinterpret_cast<void*>(&process_event_detour), "UObject::ProcessEvent");
+        const bool tick = install_hook(reinterpret_cast<void**>(&g_engine_tick_original), reinterpret_cast<void*>(&engine_tick_detour), "UGameEngine::Tick");
         g_ready = pe && tick;
         Output::send<LogLevel::Verbose>(STR("[fue] init: base {}, {} exe verified, detours {} (loader thread {})\n"), static_cast<void*>(g_base), g_build->name, g_ready ? STR("installed") : STR("FAILED"), GetCurrentThreadId());
         return g_ready;
@@ -504,6 +508,7 @@ namespace fue
 
     auto ready() -> bool { return g_ready; }
     auto build_name() -> const CharType* { return g_build ? g_build->name : STR("unsupported"); }
+    auto build_known() -> bool { return g_build != nullptr; }
 
     auto on_unreal_init(std::function<void()> callback) -> void { g_unreal_init.push_back(std::move(callback)); }
 
@@ -762,9 +767,19 @@ namespace fue
         if (!g_ready) return;
         const FName name(class_name, FNAME_Find);
         if (name.IsNone()) return;
+        std::unordered_map<const UClass*, bool> trusted{}; // a class's verdict, once per call
         for_each_object([&](UObject* o) {
             const UClass* c = o->GetClassPrivate();
-            if (c && c->GetFName() == name) out.push_back(o);
+            if (!c || c->GetFName() != name) return true;
+            auto [it, added] = trusted.try_emplace(c, true);
+            if (added && song_folder_class(c))
+            {
+                it->second = false;
+                static std::atomic<int> warned{0}; // some callers poll every tick
+                if (warned.fetch_add(1) < 8)
+                    Output::send<LogLevel::Warning>(STR("[fue] FindAllOf({}): ignoring {}, a class in a custom song's folders\n"), class_name, c->GetPathName());
+            }
+            if (it->second) out.push_back(o);
             return true;
         });
     }

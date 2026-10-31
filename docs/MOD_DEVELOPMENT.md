@@ -8,7 +8,7 @@ loader picks up. The feature is **Key Suitability**:
   - **happy** for the same key (distance 0);
   - **neutral** for 1–3 semitones;
   - **frown** for 4–6 semitones (6 is as far as two keys can be apart);
-- a **Key Suitability** on/off toggle in Settings > General turns it on and off.
+- a **Key Suitability** on/off toggle in Settings > Mods turns it on and off.
 
 The distance is deliberately naive. There is no music theory here (no relative minors, no tonics), just the gap
 between two notes on the circle of 12: `d = |songKey - masterKey| mod 12`, then `min(d, 12 - d)`. So C and B are 1
@@ -18,8 +18,8 @@ At the end you will have built:
 
 | Output | Contains |
 |---|---|
-| `out\Release\KeySuitability_P.pak` (+ `.sig`) | the new cooked assets: a widget, a Blueprint function library, three textures |
-| `out\Release\winhttp.dll` | the loader, with the native side of the feature compiled in |
+| `out\Release\Paks\mods\FUSERQualityOfLifeImprovements_P.pak` (+ `.sig`) | the mod's cooked assets, now with the new ones: a widget, a Blueprint function library, three textures |
+| `out\Release\mods\FUSERQualityOfLifeImprovements\FUSERQualityOfLifeImprovements.dll` | the Quality of Life Improvements mod, with the native side of the feature compiled in |
 
 ---
 
@@ -30,13 +30,15 @@ Every FuserNative feature has the same three parts. It helps to know them before
 1. **Cooked assets** (`*.uasset` / `*.uexp`), authored in a UE 4.24 editor project (the **modkit**,
    `modkit/FuserModkit/`), cooked, and packed into a `*_P.pak`.
    - The loader lets any pak whose name contains `_P` through FUSER's signature check.
-   - The engine mounts every pak in `Fuser\Content\Paks\`, so the assets appear in the game under `/Game/...`.
+   - The engine mounts every pak in `Fuser\Content\Paks\` and its subfolders (the mods' paks are in `mods\`), so the
+     assets appear in the game under `/Game/...`.
 2. **A call point**: a function on a modkit **Blueprint Function Library** whose Blueprint body only returns
    defaults. At runtime the native code finds it by path and points its `Func` at a C++ thunk, marking it
    `FUNC_Native`. From then on, any Blueprint that calls it runs our C++. This is how a widget reaches game data that
    the modkit cannot see, because the modkit has no FUSER classes. Here that data is the song's key and the master
    key.
-3. **Native code** in `src/native/fusernative.cpp`, compiled into `winhttp.dll`. It:
+3. **Native code** in `src/qol/fusernative.cpp`, compiled into the Quality of Life Improvements mod
+   (`FUSERQualityOfLifeImprovements.dll`, which the loader loads from `mods\`). It:
    - loads the assets;
    - binds the call point;
    - injects the widget into the game's own UI (here, every HUD song item as the game sets it up);
@@ -69,11 +71,11 @@ You need a Windows 10/11 x64 PC with a working FUSER install (Epic Games Store v
 5. **Check the base build before changing anything:**
    ```powershell
    cd <repo>\FUSERNativeLoader
-   .\build.ps1                 # out\Release\: winhttp.dll, FUSERNativeMods_P.pak / .sig
+   .\build.ps1                 # out\Release\: winhttp.dll, mods\<Name>\, Paks\mods\<Name>_P.pak / .sig
    .\install.ps1               # into $env:FUSER_GAME_ROOT (keeps your old winhttp.dll as winhttp.dll.fnl-backup)
    ```
    Start the game, then open `Fuser\Binaries\Win64\FuserNative.log`. It should show `exe verified`,
-   `self-check passed` and the settings rows being placed.
+   `self-check passed` and `[settings] Mods tab: ...` once the Settings screen is built.
 
 ---
 
@@ -194,7 +196,7 @@ Rules the modkit imposes:
 3. Copy that folder's files into the repository, **keeping the `Content\Mods\KeySuitability` path**:
    ```powershell
    $cooked = 'modkit\FuserModkit\Saved\Cooked\WindowsNoEditor\FuserModkit\Content\Mods\KeySuitability'
-   $dest   = 'mods\KeySuitability\Content\Mods\KeySuitability'
+   $dest   = 'assets\FUSERQualityOfLifeImprovements\Content\Mods\KeySuitability'
    New-Item -ItemType Directory -Force $dest | Out-Null
    Copy-Item "$cooked\*" $dest
    ```
@@ -206,44 +208,23 @@ feature: keep them in the repository alongside the cooked copies.
 
 ---
 
-## 5. Teach the build to make a pak per feature (once)
+## 5. The pak
 
-`build.ps1` packs `assets\Content\` into `FUSERNativeMods_P.pak`. Give each new feature its own pak instead, so
-it can be installed or removed on its own. In `build.ps1`, insert this block just **before** the
-`# ---- player package` line:
+Nothing to change: `build.ps1` packs every file under each bundled mod's `assets\<Mod>\Content\` into
+`out\<Configuration>\Paks\mods\<Mod>_P.pak` (+ `.sig`), and `install.ps1` and the player package put it in
+`Fuser\Content\Paks\mods\`. The Key Suitability assets copied in section 4 ride in
+`FUSERQualityOfLifeImprovements_P.pak`, beside the key/BPM line's. A feature that should install or turn off on its
+own belongs in a mod of its own: a folder under `src\` with its `mod.ini`, a CMake target, and an entry in
+`build.ps1`'s and `install.ps1`'s `$bundledMods`.
 
-```powershell
-# ---- feature paks: every mods\<Name>\Content tree becomes out\<Configuration>\<Name>_P.pak (+ .sig)
-foreach ($mod in Get-ChildItem -LiteralPath (Join-Path $root 'mods') -Directory -ErrorAction SilentlyContinue) {
-    $modContent = Join-Path $mod.FullName 'Content'
-    $modFiles = Get-ChildItem -LiteralPath $modContent -Recurse -File -ErrorAction SilentlyContinue | Sort-Object FullName | ForEach-Object { $_.FullName }
-    if (-not $modFiles) { continue }
-    $modPak = Join-Path $outDir "$($mod.Name)_P.pak"
-    $modArgs = @($py | Select-Object -Skip 1) + @((Join-Path $root 'tools\fuser_pak_create.py'), $modPak, '--mount', '../../../Fuser/Content/', '--root', $modContent) + $modFiles
-    Invoke-Checked "fuser_pak_create.py ($($mod.Name))" { & $py[0] @modArgs | Out-Host }
-}
-```
-
-So that `-Package` ships feature paks too, replace this line of the package section:
-
-```powershell
-    Copy-Item -LiteralPath $pak, (Join-Path $outDir 'FUSERNativeMods_P.sig') -Destination $paks
-```
-
-with:
-
-```powershell
-    Get-ChildItem -LiteralPath $outDir -Filter '*_P.*' | Copy-Item -Destination $paks # FUSERNativeMods_P + every feature pak
-```
-
-The pak's name must end in **`_P`**. The loader's pak hooks (`src/dllmain.cpp`) wave through the signature check
+A pak's name must end in **`_P`**. The loader's pak hooks (`src/dllmain.cpp`) wave through the signature check
 for paks with `_P` in the name, and the mount point `../../../Fuser/Content/` maps the files onto `/Game/`.
 
 ---
 
 ## 6. The native code
 
-All changes are in `src/native/fusernative.cpp`. Each step below says where the code goes, relative to existing
+All changes are in `src/qol/fusernative.cpp`. Each step below says where the code goes, relative to existing
 code you can search for.
 
 ### 6.1 The setting
@@ -251,25 +232,11 @@ code you can search for.
 Next to the other settings flags, after the line `bool g_search_enabled = true;         // the song search box`:
 
 ```cpp
-    bool g_key_suitability = true;        // Key Suitability faces on the HUD song items (Settings toggle)
+    bool g_key_suitability = true;        // Key Suitability faces on the HUD song items (Mods tab toggle)
 ```
 
-In `load_settings()`, after the `SearchBar=` branch:
-
-```cpp
-            else if (line.rfind(L"KeySuitability=", 0) == 0)
-            {
-                g_key_suitability = _wtoi(line.c_str() + 15) != 0;
-            }
-```
-
-In `save_settings()`, after the `SearchBar=` line:
-
-```cpp
-        out << L"KeySuitability=" << (g_key_suitability ? 1 : 0) << L"\n";
-```
-
-The value lives in `Fuser\Binaries\Win64\FuserNative.ini` as `KeySuitability=1` or `0`.
+The value is a row on the Settings screen's Mods tab (section 6.4). The loader's settings (`src/loader/settings.cpp`)
+save it in `Fuser\Binaries\Win64\FuserNative.ini` as `KeySuitability=1` or `0`, once it has been changed.
 
 ### 6.2 The feature
 
@@ -281,7 +248,7 @@ section.
     // ---------------------------------------------------------------- key suitability -----------
     // A face in the top-right corner of every HUD song item: how far the song's key is from the session's master key,
     // as a raw semitone distance around the circle of 12 keys (0 = same key ... 6 = a tritone away). The widget and
-    // its call point come from KeySuitability_P.pak (modkit: /Game/Mods/KeySuitability/); without that pak the
+    // its call point come from FUSERQualityOfLifeImprovements_P.pak (modkit: /Game/Mods/KeySuitability/); without that pak the
     // feature just stays off.
     constexpr const CharType* kKsLibClassPath = STR("/Game/Mods/KeySuitability/BPL_KeySuitability.BPL_KeySuitability_C");
     constexpr const CharType* kKsLibCdoPath = STR("/Game/Mods/KeySuitability/BPL_KeySuitability.Default__BPL_KeySuitability_C");
@@ -352,7 +319,7 @@ section.
         }
     }
 
-    // Load KeySuitability_P.pak's library and widget and bind the call point (tried once: a missing pak must not turn
+    // Load FUSERQualityOfLifeImprovements_P.pak's library and widget and bind the call point (tried once: a missing pak must not turn
     // every song setup into a failed package load)
     auto ks_ready() -> bool
     {
@@ -365,8 +332,8 @@ section.
         g_ks_set_song = g_ks_widget ? find_fn(kKsFnSetSong) : nullptr;
         if (!fn || !g_ks_widget || !g_ks_set_song)
         {
-            Output::send<LogLevel::Warning>(STR("[FuserNative] key suitability: assets missing (GetKeySuitability {}, WBP_KeySuitability {}, SetSong {}) - is "
-                                                "KeySuitability_P.pak installed?\n"),
+            Output::send<LogLevel::Warning>(STR("[QoL] key suitability: assets missing (GetKeySuitability {}, WBP_KeySuitability {}, SetSong {}) - is "
+                                                "FUSERQualityOfLifeImprovements_P.pak installed?\n"),
                                             fn != nullptr, g_ks_widget != nullptr, g_ks_set_song != nullptr);
             return false;
         }
@@ -376,7 +343,7 @@ section.
         fn->SetFuncPtr(&ks_thunk);
         fn->GetFunctionFlags() |= FUNC_Native; // script callers only use Func for FUNC_Native functions
         g_ks_fn = fn;
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] key suitability: ready (GetKeySuitability bound)\n"));
+        Output::send<LogLevel::Verbose>(STR("[QoL] key suitability: ready (GetKeySuitability bound)\n"));
         return true;
     }
 
@@ -480,54 +447,31 @@ Inside `run_setup`, right after the line `on_setup_layout(item, song, is_song);`
 
 ### 6.4 The Settings row
 
-The Settings rows are built in `inject_settings_row` when the Settings screen initialises. They are refreshed at
-every `OnScreenActivated`, and their changes arrive through the ProcessEvent post-hook.
+Rows are registered with the loader's settings (`src/loader/settings.hpp`). It builds them on the Settings screen's
+Mods tab under the group's heading, puts the value on them each time the screen opens, saves every change and calls
+back with the new value.
 
-1. Next to `FWeakObjectPtr g_row_key_labels{}, g_row_search{};`, add:
-   ```cpp
-       FWeakObjectPtr g_row_ks{};
-   ```
-2. In `inject_settings_row`, after `g_row_moments = FWeakObjectPtr(moments);`, add a toggle row after the
-   snapshot-slots slider. `toggle_tpl` is the stock Subtitles row, whose class and On/Off labels it copies:
-   ```cpp
-           UObject* ks = make_toggle_row(screen, toggle_tpl, moments ? moments : search, STR("Key Suitability"));
-           g_row_ks = FWeakObjectPtr(ks);
-   ```
-3. In `on_settings_event`'s `OnScreenActivated` branch, after the line that refreshes `g_row_moments`, show the
-   current value. Use `InitializeToggleState`, as the stock screen does; it also snaps the switch graphic:
-   ```cpp
-               if (UObject* row = g_row_ks.Get())
-               {
-                   PCall init(own_fn(row, STR("InitializeToggleState")));
-                   init.set<bool>(STR("inToggled"), g_key_suitability).call(row);
-               }
-   ```
-4. In `on_process_event_post`, just **before** the line
-   `if (name == g_name_toggle_changed && context == g_row_search.Get())`, handle our toggle. Every toggle row shares
-   the event name, so the row object decides whose it is:
-   ```cpp
-           if (name == g_name_toggle_changed && context == g_row_ks.Get())
-           {
-               FProperty* p = find_param(fn, STR("isToggled"));
-               const bool on = p && static_cast<FBoolProperty*>(p)->GetPropertyValue(p->ContainerPtrToValuePtr<void>(parms));
-               if (on != g_key_suitability)
-               {
-                   g_key_suitability = on;
-                   save_settings();
-                   ks_apply_setting();
-               }
-               return;
-           }
-   ```
+In `register_settings`, after the `SearchBar` row, add:
+
+```cpp
+        add(row("KeySuitability", STR("Key Suitability"), FNL_SETTING_TOGGLE, 1, [](void*, int32_t v, int flags) {
+            g_key_suitability = v != 0;
+            if (!(flags & FNL_SETTING_INITIAL)) ks_apply_setting();
+        }));
+```
+
+The callback runs once inside `add` (`FnlApi::add_setting`) with `FNL_SETTING_INITIAL`, at unreal-init before any song item exists,
+so that call only sets the flag; after that it runs on every change. A mod DLL registers its rows the same way
+through `FnlApi::add_setting` (`sdk/fnl_mod.h`).
 
 ### 6.5 Tick and preload
 
 In `fusernative_unreal_init`'s engine-tick callback:
 
-1. After the preload log line (`[FuserNative] preload: key/BPM classes {} ({:.1f} ms)`), load the feature's assets
+1. After the preload log line (`[QoL] preload: key/BPM classes {} ({:.1f} ms)`), load the feature's assets
    while the game is still loading, rather than when the first song item appears:
    ```cpp
-                           ks_ready(); // KeySuitability_P.pak's library + widget, also while the game is still loading
+                           ks_ready(); // FUSERQualityOfLifeImprovements_P.pak's library + widget, also while the game is still loading
    ```
 2. After `setup_tick();`, add:
    ```cpp
@@ -548,15 +492,14 @@ That's all of the code. The tutorial's code was compile-checked against this tre
 
 | File | From |
 |---|---|
-| `winhttp.dll` (+ `.pdb`) | the loader with Key Suitability compiled in |
-| `FUSERNativeMods_P.pak` / `.sig` | `assets\Content` (unchanged) |
-| **`KeySuitability_P.pak` / `.sig`** | `mods\KeySuitability\Content` (the new feature's assets) |
+| `mods\FUSERQualityOfLifeImprovements\FUSERQualityOfLifeImprovements.dll` (+ `.pdb`) | the mod with Key Suitability compiled in |
+| `Paks\mods\FUSERQualityOfLifeImprovements_P.pak` / `.sig` | `assets\FUSERQualityOfLifeImprovements\Content`, now with the Key Suitability assets |
+| `winhttp.dll` and the other mods | unchanged |
 
 To install into your game:
 
 ```powershell
-.\install.ps1                                                           # winhttp.dll + FUSERNativeMods_P
-Copy-Item out\Release\KeySuitability_P.* "$env:FUSER_GAME_ROOT\Fuser\Content\Paks\"
+.\install.ps1          # the loader, every bundled mod and their paks
 ```
 
 `.\build.ps1 -Package` puts all of this in `out\FUSERNativeLoader-<version>.zip` for players.
@@ -567,21 +510,22 @@ Copy-Item out\Release\KeySuitability_P.* "$env:FUSER_GAME_ROOT\Fuser\Content\Pak
 
 1. **Start the game and check `Fuser\Binaries\Win64\FuserNative.log`** for:
    - `key suitability: ready (GetKeySuitability bound)`;
-   - `settings: toggle 'Key Suitability' = … placed true`.
+   - `[settings] Quality of Life Improvements <version>: KeySuitability = On (default)` (`(saved)` once it has been
+     changed).
 2. **Enter freestyle.** Each song item has a face in its top-right corner. Turn the key dial: within a quarter of a
    second, the songs in the new key turn happy and those far away frown.
-3. **Settings > General > Key Suitability.** Off hides every face and On brings them back. Restart the game: the
+3. **Settings > Mods > Key Suitability.** Off hides every face and On brings them back. Restart the game: the
    choice sticks (`KeySuitability=` in `FuserNative.ini`).
 
 For more detail, build and install the diagnostic loader (`.\build.ps1 -Configuration Debug` and
 `.\install.ps1 -Configuration Debug`). It adds a console window with the loader's tracing, plus debug keys; F8, for
-example, dumps crate edit and the Settings screen to the log.
+example, dumps crate edit to the log.
 
 ### Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
-| Log: `key suitability: assets missing …` | `KeySuitability_P.pak` isn't in `Content\Paks`, or an asset / function name differs from section 3 (a space, a typo, a different folder). The log line says which of the three was not found. |
+| Log: `key suitability: assets missing …` | `FUSERQualityOfLifeImprovements_P.pak` in `Content\Paks\mods` is an old one (rebuild and reinstall), or an asset / function name differs from section 3 (a space, a typo, a different folder). The log line says which of the three was not found. |
 | No faces, and no `ready` or `missing` line | `ks_ready` never ran: check the step 6.5 and 6.3 edits. |
 | Faces never change, or stay hidden | `SetSong`'s exec chain isn't fully connected (step 4.4), or `Found` is false: some songs have no key in their data, and before a session starts there is no master key. |
 | A face shows a white square | The texture wasn't cooked (the widget's texture variables have no default values), or its `.ubulk` wasn't copied. |
@@ -594,15 +538,14 @@ example, dumps crate edit and the Settings screen to the log.
 | Where | What |
 |---|---|
 | `modkit/FuserModkit/Content/Mods/KeySuitability/` | the five editor assets (source) |
-| `mods/KeySuitability/Content/Mods/KeySuitability/` | their cooked `.uasset` / `.uexp` (build input) |
-| `build.ps1` | one pak per `mods\<Name>`; the package includes every `*_P` pak |
-| `src/native/fusernative.cpp` | the setting, the feature block, the `run_setup` call, the Settings row, the tick |
+| `assets/FUSERQualityOfLifeImprovements/Content/Mods/KeySuitability/` | their cooked `.uasset` / `.uexp` (build input) |
+| `src/qol/fusernative.cpp` | the setting, the feature block, the `run_setup` call, the Settings row, the tick |
 
 To go further, keep the same shape:
 - more call points on the library (each one a thunk plus a line in `ks_ready`);
 - more widgets injected from `ks_on_setup`;
-- more Settings rows (`make_dropdown_row`, `make_toggle_row`, `make_slider_row`).
+- more Mods tab rows (`add` with `FNL_SETTING_CHOICE` or `FNL_SETTING_SLIDER`).
 
-To keep a larger feature's code in its own file, move the block into a new `src/native/*.cpp`. The helpers it uses
+To keep a larger feature's code in its own file, move the block into a new `src/qol/*.cpp`. The helpers it uses
 (`PCall`, `NativeArgs`, `load_class`, …) then need to move from `fusernative.cpp`'s anonymous namespace into a
 shared header.

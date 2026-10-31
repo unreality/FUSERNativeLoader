@@ -1,10 +1,15 @@
 #pragma once
 
-// The custom-song pak layout check. A *_P pak overrides base game content, so a pak
-// received from another player is mounted only when it is shaped like every community song pak:
-//   - UE4 pak version 8, unencrypted index, no encrypted entries;
+// The custom-song pak layout check. A *_P pak overrides base game content, and its packages are loaded into the
+// game, so a pak received from another player is mounted only when it is shaped like every community song pak:
+//   - UE4 pak version 8, unencrypted index, no encrypted or compressed entries;
 //   - mount point ../../../Fuser/Content/;
-//   - every entry under Audio/Songs/<X>/, DLC/Songs/<X>/ or UI/AlbumArt/T_<X>* (no deeper path there);
+//   - every entry a .uasset, .uexp or .ubulk of a package under Audio/Songs/<X>/ or DLC/Songs/<X>/, or the album
+//     art UI/AlbumArt/T_<X> or T_<X>_small;
+//   - every .uasset a cooked UE 4.24 package whose exports are top-level objects of the song classes (CelSongSet,
+//     SongCelData, SongTransitionCelData, HmxMidiSongAsset, HmxMidiFileAsset, HmxFusionAsset, Texture2D), with
+//     their class default objects as templates, and whose imports are only those classes, their default objects
+//     and objects in the song's own packages: no Blueprint classes or functions, no other classes or packages;
 //   - at most 64 MB.
 // The sender checks its own file with the same rule before offering it.
 

@@ -10,6 +10,8 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <string>
+#include <tuple>
 #include <vector>
 
 // zlib's crc32 (lib/libarchive/zlib.lib, linked for libarchive): the same CRC the engine's chunk hashes use
@@ -65,16 +67,197 @@ namespace p2p
 
         auto starts(const std::string& s, const std::string& p) -> bool { return s.rfind(p, 0) == 0; }
 
-        // An entry name (relative to the mount point) inside the song's own folders.
-        auto allowed(const std::string& name, const std::string& x) -> bool
+        // A package path relative to /Game/ (no extension) inside the song's own folders: anything under
+        // Audio/Songs/<X>/ or DLC/Songs/<X>/, and the album art UI/AlbumArt/T_<X> and T_<X>_small.
+        auto own_package(const std::string& rel, const std::string& x) -> bool
         {
-            if (name.empty() || name.find('\\') != std::string::npos || name.front() == '/' || name.find("..") != std::string::npos ||
-                name.find(':') != std::string::npos)
+            if (rel.empty() || rel.find_first_of("\\:.") != std::string::npos || rel.front() == '/' || rel.back() == '/' || rel.find("//") != std::string::npos)
                 return false;
             for (const std::string root : {"Audio/Songs/", "DLC/Songs/"})
-                if (starts(name, root + x + "/") && name.size() > root.size() + x.size() + 1) return true;
-            const std::string art = "UI/AlbumArt/T_" + x;
-            return starts(name, art) && name.find('/', 12) == std::string::npos; // UI/AlbumArt/<file> (12 chars before it), no deeper
+                if (starts(rel, root + x + "/")) return true;
+            return rel == "UI/AlbumArt/T_" + x || rel == "UI/AlbumArt/T_" + x + "_small";
+        }
+
+        // An entry name (relative to the mount point): a package file of one of the song's own packages.
+        auto allowed(const std::string& name, const std::string& x) -> bool
+        {
+            const size_t dot = name.rfind('.');
+            if (dot == std::string::npos) return false;
+            const std::string ext = name.substr(dot);
+            return (ext == ".uasset" || ext == ".uexp" || ext == ".ubulk") && own_package(name.substr(0, dot), x);
+        }
+
+        // ---- The package check: what a song's .uasset may declare ----
+        // Every community song package is a cooked UE 4.24 package whose exports are top-level objects of seven
+        // classes, each with its class default object as template, and whose imports are those classes, their default
+        // objects, and objects of those classes in the song's own packages. Nothing else is accepted: a package that
+        // defines a class or function (a Blueprint), or imports any other class or package, could put objects into
+        // the game whose code is not the game's.
+        constexpr uint32_t kPackageTag = 0x9E2A83C1, kFilterEditorOnly = 0x80000000;
+        constexpr int32_t kLegacyFileVersion = -7; // UE 4.24
+        constexpr size_t kImportBytes = 28, kExportBytes = 104, kMaxUassetBytes = 4u * 1024 * 1024;
+        constexpr int32_t kMaxTable = 1 << 16;
+        constexpr uint32_t kUncompressedEntryHeader = 8 + 8 + 8 + 4 + 20 + 1 + 4; // the FPakEntry copy before an uncompressed entry's data
+
+        struct SongClass
+        {
+            const char* package;
+            const char* name;
+        };
+        constexpr SongClass kSongClasses[] = {
+            {"/Script/Hype", "CelSongSet"},         {"/Script/Hype", "SongCelData"},          {"/Script/Hype", "SongTransitionCelData"},
+            {"/Script/HmxAudio", "HmxMidiSongAsset"}, {"/Script/HmxAudio", "HmxMidiFileAsset"}, {"/Script/HmxAudio", "HmxFusionAsset"},
+            {"/Script/Engine", "Texture2D"},
+        };
+        auto song_class(const std::string& package, const std::string& name) -> bool
+        {
+            for (const SongClass& c : kSongClasses)
+                if (package == c.package && name == c.name) return true;
+            return false;
+        }
+        auto script_package(const std::string& name) -> bool
+        {
+            for (const SongClass& c : kSongClasses)
+                if (name == c.package) return true;
+            return false;
+        }
+
+        // A name map entry or summary string: ANSI, or UTF-16 (each non-ASCII character becomes '?').
+        auto any_fstring(Reader& r, std::string* out) -> bool
+        {
+            const int32_t n = r.get<int32_t>();
+            if (!r.ok || n == 0 || n > 1024 || n < -1024) return r.ok = false;
+            out->clear();
+            if (n > 0)
+            {
+                if (r.at + static_cast<size_t>(n) > r.b.size() || r.b[r.at + static_cast<size_t>(n) - 1] != 0) return r.ok = false;
+                out->assign(r.b.data() + r.at, static_cast<size_t>(n) - 1);
+                r.at += static_cast<size_t>(n);
+                return true;
+            }
+            for (int32_t i = 0; i < -n && r.ok; ++i)
+            {
+                const uint16_t c = r.get<uint16_t>();
+                if (i + 1 < -n) out->push_back(c < 0x80 ? static_cast<char>(c) : '?');
+            }
+            return r.ok;
+        }
+
+        auto check_package(const std::vector<char>& data, const std::string& x, std::string* why) -> bool
+        {
+            const auto fail = [&](std::string w) {
+                *why = std::move(w);
+                return false;
+            };
+            Reader r{data};
+            const uint32_t tag = r.get<uint32_t>();
+            const int32_t legacy = r.get<int32_t>();
+            if (!r.ok || tag != kPackageTag || legacy != kLegacyFileVersion) return fail("not a UE 4.24 package");
+            r.skip(4 + 4 + 4); // LegacyUE3Version, FileVersionUE4, FileVersionLicenseeUE4
+            const int32_t custom_versions = r.get<int32_t>();
+            if (!r.ok || custom_versions < 0 || custom_versions > 64) return fail("bad custom version count");
+            r.skip(static_cast<size_t>(custom_versions) * 20);
+            r.skip(4); // TotalHeaderSize
+            std::string folder;
+            if (!any_fstring(r, &folder)) return fail("unreadable summary");
+            const uint32_t package_flags = r.get<uint32_t>();
+            // Without FilterEditorOnly a LocalizationId follows NameOffset; cooked packages always have it.
+            if (!r.ok || !(package_flags & kFilterEditorOnly)) return fail("not a cooked package");
+            int32_t v[9]{}; // NameCount, NameOffset, GatherableTextDataCount, ...Offset, ExportCount, ExportOffset, ImportCount, ImportOffset, DependsOffset
+            for (int32_t& i : v) i = r.get<int32_t>();
+            const auto [name_count, name_offset, text_count, text_offset, export_count, export_offset, import_count, import_offset, depends_offset] = v;
+            (void)text_offset;
+            if (!r.ok || name_count <= 0 || name_count > kMaxTable || export_count <= 0 || export_count > kMaxTable || import_count < 0 ||
+                import_count > kMaxTable || text_count != 0)
+                return fail("implausible table counts");
+            if (name_offset < static_cast<int32_t>(r.at) || static_cast<size_t>(import_offset) + import_count * kImportBytes != static_cast<size_t>(export_offset) ||
+                static_cast<size_t>(export_offset) + export_count * kExportBytes != static_cast<size_t>(depends_offset) ||
+                static_cast<size_t>(depends_offset) > data.size())
+                return fail("tables out of place");
+
+            // Names (FString + 4 bytes of hashes); they must end where the imports start.
+            std::vector<std::string> names(static_cast<size_t>(name_count));
+            Reader nr{data, static_cast<size_t>(name_offset)};
+            for (std::string& n : names)
+            {
+                if (!any_fstring(nr, &n)) return fail("unreadable name map");
+                nr.skip(4);
+            }
+            if (!nr.ok || nr.at != static_cast<size_t>(import_offset)) return fail("name map out of place");
+            bool bad_name = false;
+            const auto name = [&](Reader& t) -> std::string { // an FName: index + number (number N > 0 is the suffix _N-1)
+                const int32_t index = t.get<int32_t>(), number = t.get<int32_t>();
+                if (!t.ok || index < 0 || index >= name_count || number < 0)
+                {
+                    bad_name = true;
+                    return {};
+                }
+                return number ? names[static_cast<size_t>(index)] + "_" + std::to_string(number - 1) : names[static_cast<size_t>(index)];
+            };
+
+            struct Import
+            {
+                std::string class_package, class_name, object;
+                int32_t outer = 0;
+            };
+            std::vector<Import> imports(static_cast<size_t>(import_count));
+            Reader ir{data, static_cast<size_t>(import_offset)};
+            for (Import& i : imports)
+            {
+                i.class_package = name(ir);
+                i.class_name = name(ir);
+                i.outer = ir.get<int32_t>();
+                i.object = name(ir);
+            }
+            if (!ir.ok || bad_name) return fail("unreadable import table");
+            const auto import_at = [&](int32_t index) -> const Import* { // a package index < 0 is import -index-1
+                return index < 0 && -static_cast<int64_t>(index) <= import_count ? &imports[static_cast<size_t>(-(index + 1))] : nullptr;
+            };
+            const auto package_import = [&](int32_t index) -> const Import* {
+                const Import* p = import_at(index);
+                return p && p->class_name == "Package" ? p : nullptr;
+            };
+            for (const Import& i : imports)
+            {
+                if (i.class_name == "Package")
+                {
+                    if (i.class_package != "/Script/CoreUObject" || i.outer != 0) return fail("import of package " + i.object + " is malformed");
+                    if (!script_package(i.object) && !(starts(i.object, "/Game/") && own_package(i.object.substr(6), x)))
+                        return fail("imports package " + i.object + " (outside the song's folders)");
+                    continue;
+                }
+                const Import* outer = package_import(i.outer);
+                if (!outer) return fail("import " + i.object + " is not inside an imported package");
+                if (i.class_name == "Class")
+                {
+                    if (i.class_package != "/Script/CoreUObject" || !song_class(outer->object, i.object))
+                        return fail("imports class " + outer->object + "." + i.object);
+                    continue;
+                }
+                if (!song_class(i.class_package, i.class_name)) return fail("imports an object of class " + i.class_package + "." + i.class_name);
+                if (script_package(outer->object) && (outer->object != i.class_package || i.object != "Default__" + i.class_name))
+                    return fail("imports " + outer->object + "." + i.object);
+            }
+
+            Reader er{data, static_cast<size_t>(export_offset)};
+            for (int32_t e = 0; e < export_count; ++e)
+            {
+                er.at = static_cast<size_t>(export_offset) + static_cast<size_t>(e) * kExportBytes;
+                const int32_t class_index = er.get<int32_t>(), super_index = er.get<int32_t>(), template_index = er.get<int32_t>(),
+                              outer_index = er.get<int32_t>();
+                const std::string object = name(er);
+                if (!er.ok || bad_name) return fail("unreadable export table");
+                const Import* cls = import_at(class_index);
+                if (!cls || cls->class_name != "Class") return fail("export " + object + " has a class defined in the package");
+                if (super_index != 0) return fail("export " + object + " is a struct, class or function");
+                if (outer_index != 0) return fail("export " + object + " is a subobject");
+                if (template_index != 0)
+                {
+                    const Import* t = import_at(template_index);
+                    if (!t || t->class_name != cls->object || t->object != "Default__" + cls->object) return fail("export " + object + " has a foreign template");
+                }
+            }
+            return true;
         }
     } // namespace
 
@@ -133,6 +316,7 @@ namespace p2p
         if (mount != "../../../Fuser/Content/") return fail("mount point '" + mount + "' (want ../../../Fuser/Content/)");
         const int32_t entries = r.get<int32_t>();
         if (!r.ok || entries <= 0 || entries > kMaxEntries) return fail("implausible entry count");
+        std::vector<std::tuple<std::string, int64_t, int64_t>> packages; // .uasset entries: name, data offset, size
         for (int32_t i = 0; i < entries; ++i)
         {
             std::string name;
@@ -140,19 +324,34 @@ namespace p2p
             const int64_t offset = r.get<int64_t>(), length = r.get<int64_t>(), uncompressed = r.get<int64_t>();
             const uint32_t method = r.get<uint32_t>();
             r.skip(20);
-            if (method != 0)
-            {
-                const int32_t blocks = r.get<int32_t>();
-                if (!r.ok || blocks < 0 || blocks > kMaxBlocks) return fail(std::format("{}: bad compression blocks", name));
-                r.skip(static_cast<size_t>(blocks) * 16);
-            }
+            if (!r.ok) return fail(std::format("entry {}: index ends early", i));
+            // Community song paks are packed uncompressed (their footers name no compression method).
+            if (method != 0) return fail(name + ": compressed entry");
             const uint8_t flags = r.get<uint8_t>();
             r.skip(4);
             if (!r.ok) return fail(std::format("entry {}: index ends early", i));
             if (flags & kEntryEncrypted) return fail(name + ": encrypted entry");
-            if (offset < 0 || length < 0 || uncompressed < 0 || static_cast<uint64_t>(offset) + static_cast<uint64_t>(length) > index_offset)
+            if (offset < 0 || length < 0 || uncompressed != length ||
+                static_cast<uint64_t>(offset) + kUncompressedEntryHeader + static_cast<uint64_t>(length) > index_offset)
                 return fail(name + ": data outside the file");
-            if (!allowed(name, x)) return fail("'" + name + "' is outside the song's folders (Audio/Songs/" + x + "/, DLC/Songs/" + x + "/, UI/AlbumArt/T_" + x + "*)");
+            if (!allowed(name, x))
+                return fail("'" + name + "' is not a package file in the song's folders (Audio/Songs/" + x + "/, DLC/Songs/" + x + "/, UI/AlbumArt/T_" + x +
+                            ", UI/AlbumArt/T_" + x + "_small)");
+            if (name.ends_with(".uasset"))
+            {
+                if (static_cast<uint64_t>(length) > kMaxUassetBytes) return fail(name + ": over 4 MB");
+                packages.emplace_back(name, offset + kUncompressedEntryHeader, length);
+            }
+        }
+        // Each .uasset's summary and tables (its exports' data is in the .uexp), read where the engine reads it: after
+        // the entry's header copy, for the index entry's size.
+        for (const auto& [name, at, length] : packages)
+        {
+            std::vector<char> data(static_cast<size_t>(length));
+            in.seekg(static_cast<std::streamoff>(at));
+            if (!in.read(data.data(), static_cast<std::streamsize>(data.size()))) return fail(name + ": cannot read it");
+            std::string why_package;
+            if (!check_package(data, x, &why_package)) return fail(name + ": " + why_package);
         }
         return true;
     }

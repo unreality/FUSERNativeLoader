@@ -1,5 +1,6 @@
-// FuserNative - FUSER's native call points and UI extensions, built into winhttp.dll on the fue core (fue provides
-// the UE4SS API names the code was first written against).
+// FuserNative - FUSER's native call points and UI extensions: the FUSERQualityOfLifeImprovements mod, on the loader's
+// fue core (fue provides the UE4SS API names the code was first written against). Its settings are rows on the
+// Settings screen's Mods tab, under the mod's heading (register_settings).
 //
 // Key/BPM line: native call points + a modkit widget injected into the HUD song items.
 //
@@ -60,6 +61,7 @@
 #include <vector>
 
 #include "fue/fue.hpp"
+#include "fnl_mod.h"
 
 #ifndef FNL_VERSION
 #define FNL_VERSION "dev" // CMake passes the VERSION file's contents
@@ -69,10 +71,13 @@
 
 using namespace fue;
 
-extern bool fnl_genre9_requestable; // dllmain.cpp: the live-requests genre loop covers genre 9 (see clamp_song_genres)
+extern bool fnl_genre9_requestable; // plugin_entry.cpp: the live-requests genre loop covers genre 9 (see clamp_song_genres)
 
 namespace
 {
+    const FnlApi* g_api = nullptr; // the loader's (fusernative_start)
+    FnlMod* g_self = nullptr;
+
     constexpr const CharType* kLibClassPath = STR("/Game/Mods/FuserNative/BPL_FuserNative.BPL_FuserNative_C");
     constexpr const CharType* kLibCdoPath = STR("/Game/Mods/FuserNative/BPL_FuserNative.Default__BPL_FuserNative_C");
     constexpr const CharType* kFnKeyBpm = STR("/Game/Mods/FuserNative/BPL_FuserNative.BPL_FuserNative_C:GetSongKeyBpm");
@@ -113,26 +118,15 @@ namespace
     FName g_name_collection_pane{}, g_name_crate_edit{}, g_name_get_list_data{};
     int g_log_pe_calls = 0, g_log_script_calls = 0, g_log_inject = 0, g_log_set_song = 0, g_log_padding = 0;
 
-    // Mod settings kept in FuserNative.ini; KeyBpmDisplay lives with its swap further down
+    // Mod settings: rows on the Settings screen's Mods tab (register_settings), saved in FuserNative.ini; KeyBpmDisplay
+    // lives with its swap further down
     constexpr int32 kKeyLabelsFlats = 0, kKeyLabelsSharps = 1, kKeyLabelsBoth = 2;
     int32 g_key_labels = kKeyLabelsFlats; // stock
     bool g_search_enabled = true;         // the song search box
-    bool g_extra_sort = true;             // Key and BPM in crate edit's Sort dropdown (ExtraSortOptions=0: ini only)
+    bool g_extra_sort = true;            // Key and BPM in crate edit's Sort dropdown (ExtraSortOptions=0: ini only)
     // New-crate slot counts: -1 = never set in our Settings rows, the game's own value stands. Only
     // FuserNative.ini holds them (Game.ini is reset by the game, so it is neither read nor written for this).
     int32 g_new_crate_songs = -1, g_new_crate_moments = -1;
-    // Song delivery: Download Songs and Download Mix Songs (No / Temporarily / Permanently), and Send Songs to
-    // Other Players. FUSERMultiplayer.dll reads the same keys from FuserNative.ini; these are the screen's copies.
-    constexpr int32 kDownloadNo = 0, kDownloadTemporarily = 1, kDownloadPermanently = 2;
-    int32 g_download_songs = kDownloadPermanently;     // default: the behaviour before the setting existed
-    int32 g_download_mix_songs = kDownloadTemporarily; // a shared mix's songs: kept for this run unless asked
-    bool g_send_songs = false;                     // opt-in
-    // Upload Speed Limit (SendSongsKBps, each transfer's pacing cap) and Simultaneous Uploads (SendSongsMax): read by
-    // FUSERMultiplayer.dll when a transfer starts / a request arrives, so a change never touches transfers under way.
-    // A hand-edited SendSongsKBps outside the list is kept until the row is changed (the row shows the nearest).
-    constexpr int32 kSendKbpsOptions[] = {256, 512, 1024, 2048, 4096};
-    constexpr int32 kSendMaxMin = 1, kSendMaxMax = 4;
-    int32 g_send_kbps = 2048, g_send_max = 2; // the defaults FUSERMultiplayer.dll uses without the keys
     StringType g_key_text_cache[12][2]{}; // game_key_text; cleared when Key Labels changes
 
     // ---------------------------------------------------------------- song data (reflection) -----
@@ -362,7 +356,7 @@ namespace
                 md.set<uint8_t>(STR("Key"), static_cast<uint8_t>(i)).call(cdo);
                 modes += (i ? STR(", ") : STR("")) + md.get_text(STR("ReturnValue"));
             }
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] key names from HypeBPFL: keys [{}], modes [{}]\n"), all, modes);
+            Output::send<LogLevel::Verbose>(STR("[QoL] key names from HypeBPFL: keys [{}], modes [{}]\n"), all, modes);
         }
         return cache[key][m];
     }
@@ -429,7 +423,7 @@ namespace
             sharps += (sharps.empty() ? STR("") : STR(", ")) + s;
         }
         g_key_names_ready = true;
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] key labels: flats [{}, {}, {}, {}, {}], sharps [{}]\n"), g_flat_names[1], g_flat_names[3], g_flat_names[6], g_flat_names[8],
+        Output::send<LogLevel::Verbose>(STR("[QoL] key labels: flats [{}, {}, {}, {}, {}], sharps [{}]\n"), g_flat_names[1], g_flat_names[3], g_flat_names[6], g_flat_names[8],
                                         g_flat_names[10], sharps);
     }
 
@@ -457,11 +451,11 @@ namespace
             if (label.empty()) return;
             const FText value(label.c_str());
             ret->CopyCompleteValue(ctx.RESULT_DECL, &value);
-            if (g_log_keys++ < kLogLimit) Output::send<LogLevel::Verbose>(STR("[FuserNative] key labels: '{}' -> '{}'\n"), flat, label);
+            if (g_log_keys++ < kLogLimit) Output::send<LogLevel::Verbose>(STR("[QoL] key labels: '{}' -> '{}'\n"), flat, label);
         }
         catch (const std::exception& e)
         {
-            Output::send<LogLevel::Error>(STR("[FuserNative] key labels: exception {}\n"), to_wstring(e.what()));
+            Output::send<LogLevel::Error>(STR("[QoL] key labels: exception {}\n"), to_wstring(e.what()));
         }
     }
 
@@ -553,7 +547,7 @@ namespace
         int& n = args.script_mode() ? g_log_script_calls : g_log_pe_calls;
         if (n++ < kLogLimit)
         {
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] native {} ({} mode) for '{}'\n"), what,
+            Output::send<LogLevel::Verbose>(STR("[QoL] native {} ({} mode) for '{}'\n"), what,
                                             args.script_mode() ? STR("script-call") : STR("ProcessEvent"), song_name(song));
         }
     }
@@ -601,7 +595,7 @@ namespace
         FProperty* path_prop = find_field(asset_data_struct, STR("ObjectPath"));
         if (!helpers || !get_asset || !path_prop)
         {
-            Output::send<LogLevel::Warning>(STR("[FuserNative] load: lookup failed - AssetRegistryHelpers CDO {}, GetAsset {}, AssetData.ObjectPath {}\n"),
+            Output::send<LogLevel::Warning>(STR("[QoL] load: lookup failed - AssetRegistryHelpers CDO {}, GetAsset {}, AssetData.ObjectPath {}\n"),
                                             helpers ? STR("ok") : STR("MISSING"), get_asset ? STR("ok") : STR("MISSING"),
                                             path_prop ? STR("ok") : STR("MISSING"));
             return nullptr;
@@ -612,7 +606,7 @@ namespace
         *path_prop->ContainerPtrToValuePtr<FName>(asset_data) = FName(class_path, FNAME_Add);
         c.call(helpers);
         auto* loaded = c.get<UObject*>(STR("ReturnValue"));
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] load: GetAsset({}) returned {}\n"), class_path,
+        Output::send<LogLevel::Verbose>(STR("[QoL] load: GetAsset({}) returned {}\n"), class_path,
                                         loaded ? loaded->GetFullName() : StringType{STR("null")});
         return UObjectGlobals::StaticFindObject<UClass*>(nullptr, nullptr, class_path);
     }
@@ -630,21 +624,21 @@ namespace
         g_fn_kt = find_fn(kFnKeyText);
         if (!g_fn_kb || !g_fn_kt)
         {
-            Output::send<LogLevel::Warning>(STR("[FuserNative] bind: functions not found ({} / {})\n"), g_fn_kb != nullptr, g_fn_kt != nullptr);
+            Output::send<LogLevel::Warning>(STR("[QoL] bind: functions not found ({} / {})\n"), g_fn_kb != nullptr, g_fn_kt != nullptr);
             return false;
         }
         root(g_fn_kb);
         root(g_fn_kt);
         root(UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr, kLibCdoPath));
         const uint32 old_kb = g_fn_kb->GetFunctionFlags(), old_kt = g_fn_kt->GetFunctionFlags();
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] bind: GetSongKeyBpm Func {} -> {}; GetSongKeyText Func {} -> {}\n"),
+        Output::send<LogLevel::Verbose>(STR("[QoL] bind: GetSongKeyBpm Func {} -> {}; GetSongKeyText Func {} -> {}\n"),
                                         reinterpret_cast<void*>(g_fn_kb->GetFuncPtr()), reinterpret_cast<void*>(&thunk_GetSongKeyBpm),
                                         reinterpret_cast<void*>(g_fn_kt->GetFuncPtr()), reinterpret_cast<void*>(&thunk_GetSongKeyText));
         g_fn_kb->SetFuncPtr(&thunk_GetSongKeyBpm);
         g_fn_kt->SetFuncPtr(&thunk_GetSongKeyText);
         g_fn_kb->GetFunctionFlags() |= FUNC_Native;
         g_fn_kt->GetFunctionFlags() |= FUNC_Native;
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] bind: FunctionFlags 0x{:08X} -> 0x{:08X}, 0x{:08X} -> 0x{:08X} (FUNC_Native)\n"),
+        Output::send<LogLevel::Verbose>(STR("[QoL] bind: FunctionFlags 0x{:08X} -> 0x{:08X}, 0x{:08X} -> 0x{:08X} (FUNC_Native)\n"),
                                         old_kb, g_fn_kb->GetFunctionFlags(), old_kt, g_fn_kt->GetFunctionFlags());
         return true;
     }
@@ -666,7 +660,7 @@ namespace
             }
             else if (first)
             {
-                Output::send<LogLevel::Warning>(STR("[FuserNative] ready: BPL_FuserNative not loaded\n"));
+                Output::send<LogLevel::Warning>(STR("[QoL] ready: BPL_FuserNative not loaded\n"));
             }
         }
         if (!g_widget_class)
@@ -677,7 +671,7 @@ namespace
             root(g_fn_set_song);
             if (first && (!g_widget_class || !g_fn_set_song))
             {
-                Output::send<LogLevel::Warning>(STR("[FuserNative] ready: WBP_FuserKeyBpm {} / SetSong {}\n"),
+                Output::send<LogLevel::Warning>(STR("[QoL] ready: WBP_FuserKeyBpm {} / SetSong {}\n"),
                                                 g_widget_class ? STR("ok") : STR("MISSING"), g_fn_set_song ? STR("ok") : STR("MISSING"));
             }
         }
@@ -827,164 +821,18 @@ namespace
     bool g_clamp_genres = true; // ClampSongGenres (see clamp_song_genres)
     int g_log_swap = 0;
 
-    // Our settings file: Fuser/Binaries/Win64/FuserNative.ini, next to winhttp.dll. Plain key=value lines.
-    auto settings_path() -> std::filesystem::path
+    // The settings without a row (FuserNative.ini only): ExtraSortOptions and ClampSongGenres. The rest are rows on the
+    // Settings screen's Mods tab (register_settings).
+    auto load_ini_settings() -> void
     {
-        return std::filesystem::path(fue::module_dir()) / L"FuserNative.ini"; // next to winhttp.dll
-    }
-
-    auto load_settings() -> void
-    {
-        const auto path = settings_path();
-        std::wifstream in(path);
+        std::wifstream in(std::filesystem::path(fue::module_dir()) / L"FuserNative.ini");
         std::wstring line{};
-        bool download_set = false, store_auto_off = false;
         while (std::getline(in, line))
         {
             if (!line.empty() && line.back() == L'\r') line.pop_back();
-            if (line.rfind(L"DownloadSongs=", 0) == 0)
-            {
-                const int32 v = _wtoi(line.c_str() + 14);
-                if (v >= kDownloadNo && v <= kDownloadPermanently) g_download_songs = v, download_set = true;
-            }
-            else if (line.rfind(L"DownloadMixSongs=", 0) == 0)
-            {
-                const int32 v = _wtoi(line.c_str() + 17);
-                if (v >= kDownloadNo && v <= kDownloadPermanently) g_download_mix_songs = v;
-            }
-            else if (line.rfind(L"SendSongs=", 0) == 0)
-            {
-                g_send_songs = _wtoi(line.c_str() + 10) != 0;
-            }
-            else if (line.rfind(L"SendSongsKBps=", 0) == 0)
-            {
-                if (const int32 v = _wtoi(line.c_str() + 14); v > 0) g_send_kbps = v;
-            }
-            else if (line.rfind(L"SendSongsMax=", 0) == 0)
-            {
-                g_send_max = std::clamp(_wtoi(line.c_str() + 13), kSendMaxMin, kSendMaxMax);
-            }
-            else if (line.rfind(L"StoreAutoInstall=", 0) == 0)
-            {
-                store_auto_off = _wtoi(line.c_str() + 17) == 0; // the old key DownloadSongs replaces: 0 reads as No
-            }
-            else if (line.rfind(L"KeyBpmDisplay=", 0) == 0)
-            {
-                const int32 v = _wtoi(line.c_str() + 14);
-                if (v >= kKeyBpmOnIdle && v <= kKeyBpmOff) g_keybpm_mode = v;
-            }
-            else if (line.rfind(L"KeyLabels=", 0) == 0)
-            {
-                const int32 v = _wtoi(line.c_str() + 10);
-                if (v >= kKeyLabelsFlats && v <= kKeyLabelsBoth) g_key_labels = v;
-            }
-            else if (line.rfind(L"SearchBar=", 0) == 0)
-            {
-                g_search_enabled = _wtoi(line.c_str() + 10) != 0;
-            }
-            else if (line.rfind(L"ExtraSortOptions=", 0) == 0)
-            {
-                g_extra_sort = _wtoi(line.c_str() + 17) != 0;
-            }
-            else if (line.rfind(L"NewCrateSongSlots=", 0) == 0)
-            {
-                g_new_crate_songs = _wtoi(line.c_str() + 18);
-            }
-            else if (line.rfind(L"NewCrateSnapshotSlots=", 0) == 0)
-            {
-                g_new_crate_moments = _wtoi(line.c_str() + 22);
-            }
-            else if (line.rfind(L"ClampSongGenres=", 0) == 0)
-            {
-                g_clamp_genres = _wtoi(line.c_str() + 16) != 0;
-            }
+            if (line.rfind(L"ExtraSortOptions=", 0) == 0) g_extra_sort = _wtoi(line.c_str() + 17) != 0;
+            else if (line.rfind(L"ClampSongGenres=", 0) == 0) g_clamp_genres = _wtoi(line.c_str() + 16) != 0;
         }
-        if (!download_set && store_auto_off) g_download_songs = kDownloadNo;
-        static const CharType* const names[] = {STR("On idle"), STR("On hover"), STR("Off")};
-        static const CharType* const labels[] = {STR("Flats"), STR("Sharps"), STR("Both")};
-        static const CharType* const downloads[] = {STR("No"), STR("Temporarily"), STR("Permanently")};
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: {} -> KeyBpmDisplay {} ({}), KeyLabels {} ({}), SearchBar {}, ExtraSortOptions {}, DownloadSongs {} ({}), "
-                                            "DownloadMixSongs {} ({}), SendSongs {}\n"),
-                                        path.wstring(), g_keybpm_mode, names[g_keybpm_mode], g_key_labels, labels[g_key_labels], g_search_enabled, g_extra_sort,
-                                        g_download_songs, downloads[g_download_songs], g_download_mix_songs, downloads[g_download_mix_songs], g_send_songs);
-    }
-
-    // FuserNative.ini is shared: the settings screen's keys and every other component's (FUSERMultiplayer.dll's Host*,
-    // Matchmaking*, P2P*, Store* ...). So a save rewrites only the screen's own lines, in place, and keeps every other
-    // line - comments, blank lines and line endings - as it was. (It used to truncate the file and write the screen's
-    // keys alone, erasing the rest at every settings change.) The file is read as
-    // bytes, so non-ASCII text in other lines survives, and replaced through a temporary file.
-    auto save_settings() -> void
-    {
-        const auto path = settings_path();
-        std::vector<std::pair<std::string, std::string>> ours{
-            {"KeyBpmDisplay=", std::to_string(g_keybpm_mode)},
-            {"KeyLabels=", std::to_string(g_key_labels)},
-            {"SearchBar=", g_search_enabled ? "1" : "0"},
-            {"DownloadSongs=", std::to_string(g_download_songs)},
-            {"DownloadMixSongs=", std::to_string(g_download_mix_songs)},
-            {"SendSongs=", g_send_songs ? "1" : "0"},
-            {"SendSongsKBps=", std::to_string(g_send_kbps)},
-            {"SendSongsMax=", std::to_string(g_send_max)},
-        };
-        if (g_new_crate_songs >= 0 && g_new_crate_moments >= 0)
-        {
-            ours.emplace_back("NewCrateSongSlots=", std::to_string(g_new_crate_songs));
-            ours.emplace_back("NewCrateSnapshotSlots=", std::to_string(g_new_crate_moments));
-        }
-        // ClampSongGenres is on by default: only the opt-out is kept, so "on" removes the line
-        const std::string clamp_key = "ClampSongGenres=";
-        std::vector<std::string> lines;
-        bool crlf = false;
-        {
-            std::ifstream in(path, std::ios::binary);
-            std::string line;
-            while (std::getline(in, line))
-            {
-                if (!line.empty() && line.back() == '\r')
-                {
-                    line.pop_back();
-                    crlf = true;
-                }
-                lines.push_back(line);
-            }
-        }
-        if (lines.empty()) lines.emplace_back("; FuserNative settings (the game's Settings screen keeps its own lines up to date)");
-        std::vector<bool> written(ours.size(), false);
-        std::vector<std::string> out_lines;
-        for (const std::string& line : lines)
-        {
-            bool handled = false;
-            for (size_t i = 0; i < ours.size() && !handled; ++i)
-            {
-                if (line.rfind(ours[i].first, 0) != 0) continue;
-                handled = true;
-                if (!written[i]) out_lines.push_back(ours[i].first + ours[i].second); // a repeat of the key is dropped
-                written[i] = true;
-            }
-            if (!handled && line.rfind(clamp_key, 0) == 0)
-            {
-                handled = true;
-                if (!g_clamp_genres) out_lines.push_back(clamp_key + "0");
-            }
-            if (!handled) out_lines.push_back(line);
-        }
-        for (size_t i = 0; i < ours.size(); ++i)
-            if (!written[i]) out_lines.push_back(ours[i].first + ours[i].second);
-        if (!g_clamp_genres && std::none_of(lines.begin(), lines.end(), [&](const std::string& l) { return l.rfind(clamp_key, 0) == 0; }))
-            out_lines.push_back(clamp_key + "0");
-        auto tmp = path;
-        tmp += L".tmp";
-        bool ok = false;
-        {
-            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-            for (const std::string& l : out_lines) out << l << (crlf ? "\r\n" : "\n");
-            ok = out.good();
-        }
-        ok = ok && MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: saved KeyBpmDisplay {} KeyLabels {} SearchBar {} DownloadSongs {} SendSongs {} to {} ({}, {} lines kept)\n"),
-                                        g_keybpm_mode, g_key_labels, g_search_enabled, g_download_songs, g_send_songs, path.wstring(), ok ? STR("ok") : STR("FAILED"),
-                                        out_lines.size());
     }
 
     struct SwapParts
@@ -1183,7 +1031,7 @@ namespace
                 ++n;
             }
         }
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: KeyBpmDisplay {} applied to {} song items\n"), g_keybpm_mode, n);
+        Output::send<LogLevel::Verbose>(STR("[QoL] settings: KeyBpmDisplay {} applied to {} song items\n"), g_keybpm_mode, n);
     }
 
     // Key Labels changed: our cached key texts go, and every live song item re-renders its line (the game's own key
@@ -1205,7 +1053,7 @@ namespace
             if (s.ours) set_song(s.ours, song.get<UObject*>(STR("ReturnValue")), obj_prop(item, STR("SongYear")));
             ++n;
         }
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: KeyLabels {} applied to {} song items\n"), g_key_labels, n);
+        Output::send<LogLevel::Verbose>(STR("[QoL] settings: KeyLabels {} applied to {} song items\n"), g_key_labels, n);
     }
 
     auto flush_deferred_setup(UObject* item) -> void; // below: a queued item's setup, now
@@ -1226,7 +1074,7 @@ namespace
         UObject* panel = widget_parent(row); // VerticalBox_Text
         if (!panel)
         {
-            if (g_log_inject++ < kLogLimit) Output::send<LogLevel::Warning>(STR("[FuserNative] inject: no VerticalBox_Text on {} (row {})\n"), item->GetFullName(), row != nullptr);
+            if (g_log_inject++ < kLogLimit) Output::send<LogLevel::Warning>(STR("[QoL] inject: no VerticalBox_Text on {} (row {})\n"), item->GetFullName(), row != nullptr);
             return;
         }
         UObject* ours = find_child_of_class(panel, g_widget_class);
@@ -1245,7 +1093,7 @@ namespace
             }
             if (g_log_inject++ < kLogLimit)
             {
-                Output::send<LogLevel::Verbose>(STR("[FuserNative] inject: {} -> {} (slot {}): [{}]\n"), item->GetName(), ours ? ours->GetName() : StringType{STR("CREATE FAILED")},
+                Output::send<LogLevel::Verbose>(STR("[QoL] inject: {} -> {} (slot {}): [{}]\n"), item->GetName(), ours ? ours->GetName() : StringType{STR("CREATE FAILED")},
                                                 slot ? slot->GetName() : StringType{STR("none")}, child_names(panel));
             }
             if (!ours || !slot) return;
@@ -1266,7 +1114,7 @@ namespace
         set_swap_target(item, false); // snap to the current mode / hover state; laid out once measured
         if (g_log_set_song++ < kLogLimit)
         {
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] SetSong '{}' on {}: KeyBpmText='{}' (expected key '{}', bpm {})\n"),
+            Output::send<LogLevel::Verbose>(STR("[QoL] SetSong '{}' on {}: KeyBpmText='{}' (expected key '{}', bpm {})\n"),
                                             song_name(song), item->GetName(), text_of(obj_prop(ours, STR("KeyBpmText"))),
                                             key_text_for(compute_key_bpm(song)), compute_key_bpm(song).bpm);
         }
@@ -1329,14 +1177,14 @@ namespace
         }
         catch (const std::exception& e)
         {
-            if (g_log_inject++ < kLogLimit) Output::send<LogLevel::Error>(STR("[FuserNative] inject: exception {}\n"), to_wstring(e.what()));
+            if (g_log_inject++ < kLogLimit) Output::send<LogLevel::Error>(STR("[QoL] inject: exception {}\n"), to_wstring(e.what()));
         }
     }
 
     auto log_burst() -> void
     {
         if (g_burst_calls && g_log_burst++ < kLogLimit * 2)
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] song items: burst of {} setups at tick {}: {} now ({:.1f} ms), {} deferred\n"), g_burst_calls, g_burst_tick,
+            Output::send<LogLevel::Verbose>(STR("[QoL] song items: burst of {} setups at tick {}: {} now ({:.1f} ms), {} deferred\n"), g_burst_calls, g_burst_tick,
                                             g_burst_now, g_burst_ms, g_burst_queued);
         g_burst_calls = g_burst_now = g_burst_queued = 0;
         g_burst_ms = 0.0;
@@ -1408,7 +1256,7 @@ namespace
         } while (!g_setup_queue.empty() && now_ms() - t0 < kSetupBudgetMs);
         g_drain_ms += now_ms() - t0;
         if (g_setup_queue.empty() && g_log_burst < kLogLimit * 2)
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] song items: {} deferred setups done over {} ticks ({:.1f} ms total)\n"), g_drain_done,
+            Output::send<LogLevel::Verbose>(STR("[QoL] song items: {} deferred setups done over {} ticks ({:.1f} ms total)\n"), g_drain_done,
                                             g_tick - g_drain_start_tick, g_drain_ms);
     }
 
@@ -1429,7 +1277,7 @@ namespace
         const bool placed = place_overlay(s, m);
         if (g_log_padding++ < kPaddingLogLimit)
         {
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] padding: {} Genre row Top {:.2f} Bottom {:.2f} -> overlay {}\n"), slot->GetName(), m ? m[1] : 0.0f,
+            Output::send<LogLevel::Verbose>(STR("[QoL] padding: {} Genre row Top {:.2f} Bottom {:.2f} -> overlay {}\n"), slot->GetName(), m ? m[1] : 0.0f,
                                             m ? m[3] : 0.0f, placed ? STR("placed") : STR("waiting for layout"));
         }
     }
@@ -1441,7 +1289,7 @@ namespace
         }
         catch (const std::exception& e)
         {
-            if (g_log_padding++ < kPaddingLogLimit) Output::send<LogLevel::Error>(STR("[FuserNative] padding: exception {}\n"), to_wstring(e.what()));
+            if (g_log_padding++ < kPaddingLogLimit) Output::send<LogLevel::Error>(STR("[QoL] padding: exception {}\n"), to_wstring(e.what()));
         }
     }
 
@@ -1464,7 +1312,7 @@ namespace
     {
         CrateSlots c{0, 0, 0};
         if (!crate) return c;
-        auto* sp = static_cast<FStructProperty*>(find_field(crate->GetClassPrivate(), STR("CrateData")));
+        auto* sp = CastField<FStructProperty>(find_field(crate->GetClassPrivate(), STR("CrateData")));
         UScriptStruct* st = sp ? sp->GetStruct().Get() : nullptr;
         if (!st) return c;
         uint8* data = sp->ContainerPtrToValuePtr<uint8>(crate);
@@ -1543,13 +1391,13 @@ namespace
         auto* inited = pool ? pool->GetValuePtrByPropertyNameInChain<bool>(STR("_isInitialized")) : nullptr;
         if (!num || !inited)
         {
-            Output::send<LogLevel::Warning>(STR("[FuserNative] tabs: {} has no SongWidgetPool/numItems\n"), list->GetFullName());
+            Output::send<LogLevel::Warning>(STR("[QoL] tabs: {} has no SongWidgetPool/numItems\n"), list->GetFullName());
             return;
         }
         const int32 want = s.songs + s.moments;
         const int32 before = *num;
         if (!*inited && *num < want) *num = want;
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] tabs: OnInitialized {} - provision songs {} instruments {} moments {} ({}); SongWidgetPool numItems {} -> {} (initialized {})\n"),
+        Output::send<LogLevel::Verbose>(STR("[QoL] tabs: OnInitialized {} - provision songs {} instruments {} moments {} ({}); SongWidgetPool numItems {} -> {} (initialized {})\n"),
                                         list->GetName(), s.songs, s.instruments, s.moments, detail, before, *num, *inited);
     }
 
@@ -1581,7 +1429,7 @@ namespace
         UObject* lists = widget_parent(first);
         if (!containers || !first || !lists)
         {
-            Output::send<LogLevel::Warning>(STR("[FuserNative] tabs: {} - Containers {} / Container_1 {} / Lists {} missing\n"), when,
+            Output::send<LogLevel::Warning>(STR("[QoL] tabs: {} - Containers {} / Container_1 {} / Lists {} missing\n"), when,
                                             containers != nullptr, first != nullptr, lists != nullptr);
             return;
         }
@@ -1619,7 +1467,7 @@ namespace
             UObject* slot = c ? add_child(lists, c) : nullptr;
             if (!slot)
             {
-                Output::send<LogLevel::Warning>(STR("[FuserNative] tabs: creating container {} failed\n"), containers->Num() + 1);
+                Output::send<LogLevel::Warning>(STR("[QoL] tabs: creating container {} failed\n"), containers->Num() + 1);
                 break;
             }
             copy_canvas_slot(first_slot, slot);
@@ -1628,7 +1476,7 @@ namespace
         }
         if (g_log_tabs++ < kLogLimit * 2)
         {
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] tabs: {} on {} - Containers {} -> {} (re-added {}, created {}, wanted {})\n"), when,
+            Output::send<LogLevel::Verbose>(STR("[QoL] tabs: {} on {} - Containers {} -> {} (re-added {}, created {}, wanted {})\n"), when,
                                             list->GetName(), before, containers->Num(), readded, created, want);
         }
     }
@@ -1641,7 +1489,7 @@ namespace
     // ISSUES.md #1, two client dumps). The era lookup cannot miss (its bucketing always returns 0..16). Only custom
     // songs carry such a Genre.
     // Genre 9 (EGenre::Num) is the community's "Indie/Alternative" (display text from a Hype.locres override). The
-    // loader widens that loop to 0..9 (dllmain.cpp ApplyGenreRequestsPatch), making 9 a requestable genre; then only
+    // mod widens that loop to 0..9 (plugin_entry.cpp's genre patch), making 9 a requestable genre; then only
     // values >= 10 (EGenre_MAX or garbage) are out of range. Without the patch (an unknown build) 9 is out of range too.
     // Every loaded CelSongSet with an out-of-range Genre gets a real genre - its SubGenre or SubSubGenre when that is
     // one, else Pop - and out-of-range sub-genres become None. Done right before the requests screen is shown, and
@@ -1671,7 +1519,7 @@ namespace
             if (*genre >= limit) *genre = *sub != 0 ? *sub : *subsub != 0 ? *subsub : kGenrePop;
             ++fixed;
             if (g_log_genres++ < 40)
-                Output::send<LogLevel::Verbose>(STR("[FuserNative] genres: '{}' Genre/SubGenre/SubSubGenre {}/{}/{} -> {}/{}/{} ({})\n"), song_name(s), was[0], was[1],
+                Output::send<LogLevel::Verbose>(STR("[QoL] genres: '{}' Genre/SubGenre/SubSubGenre {}/{}/{} -> {}/{}/{} ({})\n"), song_name(s), was[0], was[1],
                                                 was[2], *genre, *sub, *subsub, when);
         }
         return fixed;
@@ -1687,7 +1535,7 @@ namespace
         if (!type || *type->ContainerPtrToValuePtr<uint8>(parms) != kScreenLiveRequests) return;
         const int fixed = clamp_song_genres(STR("before the live-requests screen"));
         if (fixed && g_log_genres < 60)
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] genres: {} song(s) clamped before the live-requests screen\n"), fixed);
+            Output::send<LogLevel::Verbose>(STR("[QoL] genres: {} song(s) clamped before the live-requests screen\n"), fixed);
     }
 
     auto on_process_event_pre(UObject* context, UFunction* fn, void* parms) -> void
@@ -1701,7 +1549,7 @@ namespace
         }
         catch (const std::exception& e)
         {
-            Output::send<LogLevel::Error>(STR("[FuserNative] tabs: exception {}\n"), to_wstring(e.what()));
+            Output::send<LogLevel::Error>(STR("[QoL] tabs: exception {}\n"), to_wstring(e.what()));
         }
     }
 
@@ -1716,13 +1564,13 @@ namespace
                 auto* containers = list->GetValuePtrByPropertyNameInChain<TArray<UObject*>>(STR("Containers"));
                 UObject* pool = obj_prop(list, STR("SongWidgetPool"));
                 auto* num = pool ? pool->GetValuePtrByPropertyNameInChain<int32>(STR("numItems")) : nullptr;
-                Output::send<LogLevel::Verbose>(STR("[FuserNative] tabs: Construct on {} - Containers {}, SongWidgetPool numItems {}\n"),
+                Output::send<LogLevel::Verbose>(STR("[QoL] tabs: Construct on {} - Containers {}, SongWidgetPool numItems {}\n"),
                                                 list->GetName(), containers ? containers->Num() : -1, num ? *num : -1);
             }
         }
         catch (const std::exception& e)
         {
-            Output::send<LogLevel::Error>(STR("[FuserNative] tabs: exception {}\n"), to_wstring(e.what()));
+            Output::send<LogLevel::Error>(STR("[QoL] tabs: exception {}\n"), to_wstring(e.what()));
         }
     }
 
@@ -1990,7 +1838,7 @@ namespace
         UObject* root = widget_parent(bar);                                // InstancePlacementExtents
         if (!root)
         {
-            Output::send<LogLevel::Warning>(STR("[FuserNative] search: {} - top bar / root canvas not found\n"), pane->GetName());
+            Output::send<LogLevel::Warning>(STR("[QoL] search: {} - top bar / root canvas not found\n"), pane->GetName());
             return;
         }
         UClass* cls = UObjectGlobals::StaticFindObject<UClass*>(nullptr, nullptr, kTextEntryClassPath);
@@ -2004,7 +1852,7 @@ namespace
             UObject* slot = box ? add_child(root, box) : nullptr;
             if (!slot)
             {
-                Output::send<LogLevel::Warning>(STR("[FuserNative] search: creating the search box failed\n"));
+                Output::send<LogLevel::Warning>(STR("[QoL] search: creating the search box failed\n"));
                 return;
             }
             PCall layout(find_fn(STR("/Script/UMG.CanvasPanelSlot:SetLayout")));
@@ -2026,7 +1874,7 @@ namespace
         }
         g_search_box = FWeakObjectPtr(box);
         g_search_pane = FWeakObjectPtr(pane);
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] search: {} box {} on {}\n"), created ? STR("created") : STR("reusing"), box->GetName(), pane->GetFullName());
+        Output::send<LogLevel::Verbose>(STR("[QoL] search: {} box {} on {}\n"), created ? STR("created") : STR("reusing"), box->GetName(), pane->GetFullName());
     }
 
     // Native post-hook: UHypeEditableTextWidget::_OnTextChanged (bound to its EditableText's OnTextChanged)
@@ -2046,7 +1894,7 @@ namespace
         }
         catch (const std::exception& e)
         {
-            Output::send<LogLevel::Error>(STR("[FuserNative] search: exception {}\n"), to_wstring(e.what()));
+            Output::send<LogLevel::Error>(STR("[QoL] search: exception {}\n"), to_wstring(e.what()));
         }
     }
 
@@ -2064,7 +1912,7 @@ namespace
             g_search_dirty = true;
             g_search_changed_at = std::chrono::steady_clock::now() - kSearchDebounce;
         }
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: SearchBar {} (query '{}')\n"), g_search_enabled, g_search_query);
+        Output::send<LogLevel::Verbose>(STR("[QoL] settings: SearchBar {} (query '{}')\n"), g_search_enabled, g_search_query);
     }
 
     auto search_visibility_tick() -> void
@@ -2095,7 +1943,7 @@ namespace
         set_visibility(box, g_search_enabled && type == kSongsTabType ? kVisible : kCollapsed);
         if (g_log_search++ < kLogLimit * 4)
         {
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] search: tab type {} -> box {}\n"), type, type == kSongsTabType ? STR("shown") : STR("hidden"));
+            Output::send<LogLevel::Verbose>(STR("[QoL] search: tab type {} -> box {}\n"), type, type == kSongsTabType ? STR("shown") : STR("hidden"));
         }
     }
 
@@ -2123,7 +1971,7 @@ namespace
         }
         if (g_log_search++ < kLogLimit * 4)
         {
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] search: query '{}' -> rebuilt lists (editing {} -> {})\n"), g_search_query, was_editing, still_editing);
+            Output::send<LogLevel::Verbose>(STR("[QoL] search: query '{}' -> rebuilt lists (editing {} -> {})\n"), g_search_query, was_editing, still_editing);
         }
     }
 
@@ -2155,7 +2003,7 @@ namespace
                 if (kept < before) songs->RemoveAt(kept, before - kept, false);
                 if (g_log_search++ < kLogLimit * 4)
                 {
-                    Output::send<LogLevel::Verbose>(STR("[FuserNative] search: {} '{}' (text '{}', {} keys, bpm {}..{}, {} genres) kept {} of {}\n"),
+                    Output::send<LogLevel::Verbose>(STR("[QoL] search: {} '{}' (text '{}', {} keys, bpm {}..{}, {} genres) kept {} of {}\n"),
                                                     ctx.TheStack.Node()->GetName(), g_search_query, g_search_filter.text, g_search_filter.keys.size(), g_search_filter.bpm_lo,
                                                     g_search_filter.bpm_hi, g_search_filter.genres.size(), kept, before);
                 }
@@ -2175,13 +2023,13 @@ namespace
             const int32 missing = sort_songs(*songs, method, descending);
             if (g_log_sort++ < kLogLimit * 2)
             {
-                Output::send<LogLevel::Verbose>(STR("[FuserNative] sort: {} by {}{} - {} songs, {} without a {}\n"), list->GetName(), method == kSortKey ? STR("Key") : STR("BPM"),
+                Output::send<LogLevel::Verbose>(STR("[QoL] sort: {} by {}{} - {} songs, {} without a {}\n"), list->GetName(), method == kSortKey ? STR("Key") : STR("BPM"),
                                                 descending ? STR(" (descending)") : STR(""), songs->Num(), missing, method == kSortKey ? STR("key") : STR("BPM"));
             }
         }
         catch (const std::exception& e)
         {
-            Output::send<LogLevel::Error>(STR("[FuserNative] search: exception {}\n"), to_wstring(e.what()));
+            Output::send<LogLevel::Error>(STR("[QoL] search: exception {}\n"), to_wstring(e.what()));
         }
     }
 
@@ -2353,7 +2201,7 @@ namespace
 
         explicit CrateView(UObject* c) : crate(c)
         {
-            auto* sp = c ? static_cast<FStructProperty*>(find_field(c->GetClassPrivate(), STR("CrateData"))) : nullptr;
+            auto* sp = c ? CastField<FStructProperty>(find_field(c->GetClassPrivate(), STR("CrateData"))) : nullptr;
             st = sp ? sp->GetStruct().Get() : nullptr;
             data = st ? sp->ContainerPtrToValuePtr<uint8>(c) : nullptr;
             static UFunction* fn_mission = find_fn(STR("/Script/Hype.Crate:IsMissionCrate"));
@@ -2374,7 +2222,7 @@ namespace
         }
         auto constraint(const CharType* name) const -> int32 // MissionConstraint.<name>
         {
-            auto* sp = static_cast<FStructProperty*>(field(STR("MissionConstraint")));
+            auto* sp = CastField<FStructProperty>(field(STR("MissionConstraint")));
             UScriptStruct* cs = sp ? sp->GetStruct().Get() : nullptr;
             FProperty* p = find_field(cs, name);
             return p ? *p->ContainerPtrToValuePtr<int32>(sp->ContainerPtrToValuePtr<uint8>(data)) : 0;
@@ -2619,15 +2467,15 @@ namespace
         UObject* bg_size = widget_parent(total);
         UObject* crate = widget_parent(bg_size);
         UObject* row = widget_parent(crate);
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] F8: tab bar {} (TotalWidth {:.0f})\n"), layout_desc(tabs),
+        Output::send<LogLevel::Verbose>(STR("[QoL] F8: tab bar {} (TotalWidth {:.0f})\n"), layout_desc(tabs),
                                         tabs && tabs->GetValuePtrByPropertyNameInChain<float>(STR("TotalWidth")) ? *tabs->GetValuePtrByPropertyNameInChain<float>(STR("TotalWidth")) : -1.0f);
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] F8:   row {}\n"), layout_desc(row));
-        for (int32 i = 0, n = child_count(row); i < n; ++i) Output::send<LogLevel::Verbose>(STR("[FuserNative] F8:   row child {}: {}\n"), i, layout_desc(child_at(row, i)));
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] F8:   BGSize {}\n"), layout_desc(bg_size));
-        for (int32 i = 0, n = child_count(bg_size); i < n; ++i) Output::send<LogLevel::Verbose>(STR("[FuserNative] F8:   BGSize child {}: {}\n"), i, layout_desc(child_at(bg_size, i)));
+        Output::send<LogLevel::Verbose>(STR("[QoL] F8:   row {}\n"), layout_desc(row));
+        for (int32 i = 0, n = child_count(row); i < n; ++i) Output::send<LogLevel::Verbose>(STR("[QoL] F8:   row child {}: {}\n"), i, layout_desc(child_at(row, i)));
+        Output::send<LogLevel::Verbose>(STR("[QoL] F8:   BGSize {}\n"), layout_desc(bg_size));
+        for (int32 i = 0, n = child_count(bg_size); i < n; ++i) Output::send<LogLevel::Verbose>(STR("[QoL] F8:   BGSize child {}: {}\n"), i, layout_desc(child_at(bg_size, i)));
         UObject* strip = obj_prop(tabs, STR("HorizontalBox_Tabs"));
-        for (int32 i = 0, n = child_count(strip); i < n; ++i) Output::send<LogLevel::Verbose>(STR("[FuserNative] F8:   tab button {}: {}\n"), i, layout_desc(child_at(strip, i)));
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] F8:   W prompt {} / E prompt {}\n"), layout_desc(obj_prop(tabs, STR("Canvas_LB"))),
+        for (int32 i = 0, n = child_count(strip); i < n; ++i) Output::send<LogLevel::Verbose>(STR("[QoL] F8:   tab button {}: {}\n"), i, layout_desc(child_at(strip, i)));
+        Output::send<LogLevel::Verbose>(STR("[QoL] F8:   W prompt {} / E prompt {}\n"), layout_desc(obj_prop(tabs, STR("Canvas_LB"))),
                                         layout_desc(obj_prop(tabs, STR("Canvas_RB"))));
     }
 
@@ -2671,7 +2519,7 @@ namespace
         set.set<float>(STR("InWidthOverride"), target).call(box);
         if (logged++ < kLogLimit * 2)
         {
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] crate edit: tab strip width {:.0f} -> {:.0f} (TabList formula {:.0f}, buttons {:.0f})\n"), before, target, *stock, content);
+            Output::send<LogLevel::Verbose>(STR("[QoL] crate edit: tab strip width {:.0f} -> {:.0f} (TabList formula {:.0f}, buttons {:.0f})\n"), before, target, *stock, content);
         }
     }
 
@@ -2681,15 +2529,15 @@ namespace
         UObject* screen = g_crate_edit_screen.Get();
         if (!screen)
         {
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] F8: no crate-edit screen\n"));
+            Output::send<LogLevel::Verbose>(STR("[QoL] F8: no crate-edit screen\n"));
             return;
         }
         UObject* tabs = obj_prop(screen, STR("TopTabs"));
         UObject* sw = obj_prop(tabs, STR("_MyWidgetSwitcher"));
         const TabLayout l = tab_layout(screen);
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] F8: {} - {} song tabs, {} moment tabs, current tab {}, TopTabs._MyWidgetSwitcher {}\n"), screen->GetName(), l.songs,
+        Output::send<LogLevel::Verbose>(STR("[QoL] F8: {} - {} song tabs, {} moment tabs, current tab {}, TopTabs._MyWidgetSwitcher {}\n"), screen->GetName(), l.songs,
                                         l.moments, current_tab(screen), sw ? sw->GetName() : StringType{STR("null")});
-        for (int32 t = 0; t < l.total(); ++t) Output::send<LogLevel::Verbose>(STR("[FuserNative] F8:   tab {}: {}\n"), t, describe_tab(screen, t));
+        for (int32 t = 0; t < l.total(); ++t) Output::send<LogLevel::Verbose>(STR("[QoL] F8:   tab {}: {}\n"), t, describe_tab(screen, t));
         dump_tab_bar(screen);
         UObject* switcher = obj_prop(screen, STR("TopListsSwitcher"));
         for (int32 t : {kStockSongTabs - 1, kStockSongTabs})
@@ -2702,8 +2550,8 @@ namespace
                 UObject* slot = obj_prop(helper, STR("ListContentSlot"));
                 named = c.call(slot) ? c.get<UObject*>(STR("ReturnValue")) : nullptr;
             }
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] F8:   tab {} chain: {}\n"), t, widget_chain(first ? first : obj_prop(helper, STR("ItemParentWidget")), switcher));
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] F8:   tab {} helper chain: {}; ListContentSlot content {}; helper root {}\n"), t, widget_chain(helper, switcher),
+            Output::send<LogLevel::Verbose>(STR("[QoL] F8:   tab {} chain: {}\n"), t, widget_chain(first ? first : obj_prop(helper, STR("ItemParentWidget")), switcher));
+            Output::send<LogLevel::Verbose>(STR("[QoL] F8:   tab {} helper chain: {}; ListContentSlot content {}; helper root {}\n"), t, widget_chain(helper, switcher),
                                             named ? named->GetName() : StringType{STR("null")},
                                             obj_prop(obj_prop(helper, STR("WidgetTree")), STR("RootWidget")) ? obj_prop(obj_prop(helper, STR("WidgetTree")), STR("RootWidget"))->GetName() : StringType{STR("null")});
         }
@@ -2777,7 +2625,7 @@ namespace
                 pages += fmt::format(STR("\n    song page {}: {} entries, first '{}' -> {}"), p, v.size(), v.empty() || !v[0] ? StringType{STR("-")} : song_name(v[0]),
                                      describe_tab(screen, p));
             }
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] crate edit: RefreshEquippedItemLists - crate {} songs {} ({} not loaded / not CelSongSet), NumSongSlots {}{}\n"),
+            Output::send<LogLevel::Verbose>(STR("[QoL] crate edit: RefreshEquippedItemLists - crate {} songs {} ({} not loaded / not CelSongSet), NumSongSlots {}{}\n"),
                                             c.crate ? c.crate->GetName() : StringType{STR("null")}, n_songs, n_null, c.ok() ? c.i32(STR("NumSongSlots")) : -1, pages);
         }
         if (!c.ok()) return; // stock: the crate reads fail, the other lists are left alone
@@ -2826,7 +2674,7 @@ namespace
         w.call(tabs);
         if (g_log_crate_edit++ < kLogLimit * 4)
         {
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] crate edit: tabs visibility - max songs {} ({} of {} song tabs), max moments {} ({} of {} moment tabs), {} buttons\n"),
+            Output::send<LogLevel::Verbose>(STR("[QoL] crate edit: tabs visibility - max songs {} ({} of {} song tabs), max moments {} ({} of {} moment tabs), {} buttons\n"),
                                             songs, std::clamp((songs + l.per - 1) / l.per, 1, l.songs), l.songs, moments,
                                             std::clamp((moments + l.per - 1) / l.per, 0, l.moments), l.moments, buttons ? buttons->Num() : -1);
         }
@@ -2903,7 +2751,7 @@ namespace
         if (g_log_crate_edit++ < kLogLimit * 4)
         {
             static const CharType* const kinds[] = {STR("song"), STR("instruments"), STR("fx"), STR("moment"), STR("invalid")};
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] crate edit: tab {} = {} page {} -> switcher page {}, pane list {}, filters {}, {} slots unlocked\n"), active,
+            Output::send<LogLevel::Verbose>(STR("[QoL] crate edit: tab {} = {} page {} -> switcher page {}, pane list {}, filters {}, {} slots unlocked\n"), active,
                                             kinds[static_cast<int>(r.kind)], r.page, page_index, pane_list, stock_index, visible);
         }
     }
@@ -2944,7 +2792,7 @@ namespace
         set.set<int32>(STR("in_CurrentTabIndex"), target).set<bool>(STR("in_ShouldSlamAnim"), false).call(tabs);
         if (g_log_crate_edit++ < kLogLimit * 4)
         {
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] crate edit: added item -> tab {} to {} (set {})\n"), cur, target, set.get<bool>(STR("out_DidSetToDesiredTabIndex")));
+            Output::send<LogLevel::Verbose>(STR("[QoL] crate edit: added item -> tab {} to {} (set {})\n"), cur, target, set.get<bool>(STR("out_DidSetToDesiredTabIndex")));
         }
     }
 
@@ -2962,7 +2810,7 @@ namespace
         }
         catch (const std::exception& e)
         {
-            Output::send<LogLevel::Error>(STR("[FuserNative] crate edit: {} exception {}\n"), name, to_wstring(e.what()));
+            Output::send<LogLevel::Error>(STR("[QoL] crate edit: {} exception {}\n"), name, to_wstring(e.what()));
         }
     }
 
@@ -3047,7 +2895,7 @@ namespace
         }
         if (bound || !missing.empty())
         {
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] crate edit: {} - bound {} overrides, {} already bound{}{}\n"), screen->GetClassPrivate()->GetFullName(),
+            Output::send<LogLevel::Verbose>(STR("[QoL] crate edit: {} - bound {} overrides, {} already bound{}{}\n"), screen->GetClassPrivate()->GetFullName(),
                                             bound, already, missing.empty() ? STR("") : STR(", MISSING: "), missing);
         }
         return missing.empty();
@@ -3098,7 +2946,7 @@ namespace
             const FString key(STR("Shell_Sorted_By_Label"));
             c.copy_in(STR("Key"), &key);
             if (fn_table && ktl && c.call(ktl)) pattern = c.get_text(STR("ReturnValue"));
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] sort: header pattern '{}'\n"), pattern);
+            Output::send<LogLevel::Verbose>(STR("[QoL] sort: header pattern '{}'\n"), pattern);
         }
         const size_t at = pattern.find(STR("{Method}"));
         if (at == StringType::npos) return label;
@@ -3135,7 +2983,7 @@ namespace
         set.call(dropdown);
         if (g_log_sort_ui++ < kLogLimit)
         {
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] sort: dropdown built with {} entries on {}\n"), entries.num(), pane->GetName());
+            Output::send<LogLevel::Verbose>(STR("[QoL] sort: dropdown built with {} entries on {}\n"), entries.num(), pane->GetName());
         }
     }
 
@@ -3180,7 +3028,7 @@ namespace
         }
         catch (const std::exception& e)
         {
-            Output::send<LogLevel::Error>(STR("[FuserNative] sort: {} exception {}\n"), name, to_wstring(e.what()));
+            Output::send<LogLevel::Error>(STR("[QoL] sort: {} exception {}\n"), name, to_wstring(e.what()));
         }
     }
 
@@ -3221,7 +3069,7 @@ namespace
         }
         if (bound || !missing.empty())
         {
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] sort: {} - bound {} overrides{}{}\n"), pane->GetClassPrivate()->GetFullName(), bound,
+            Output::send<LogLevel::Verbose>(STR("[QoL] sort: {} - bound {} overrides{}{}\n"), pane->GetClassPrivate()->GetFullName(), bound,
                                             missing.empty() ? STR("") : STR(", MISSING: "), missing);
         }
     }
@@ -3291,7 +3139,7 @@ namespace
         UObject* style = tile_widget(tile, STR("YearField"));
         if (!stats)
         {
-            if (g_log_tiles++ < kLogLimit) Output::send<LogLevel::Warning>(STR("[FuserNative] tiles: no SongStatsExtents on {}\n"), tile->GetFullName());
+            if (g_log_tiles++ < kLogLimit) Output::send<LogLevel::Warning>(STR("[QoL] tiles: no SongStatsExtents on {}\n"), tile->GetFullName());
             return {};
         }
         float top = kStockColumnTop;
@@ -3306,7 +3154,7 @@ namespace
             UObject* slot = ours ? add_child(stats, ours) : nullptr;
             if (!slot)
             {
-                if (g_log_tiles++ < kLogLimit) Output::send<LogLevel::Warning>(STR("[FuserNative] tiles: creating the label failed on {}\n"), tile->GetName());
+                if (g_log_tiles++ < kLogLimit) Output::send<LogLevel::Warning>(STR("[QoL] tiles: creating the label failed on {}\n"), tile->GetName());
                 return {};
             }
             // FAnchorData: offsets (X 0, Y = the column's top), anchors (0.5, 0)-(0.5, 0), alignment (0.5, 1); auto size
@@ -3317,7 +3165,7 @@ namespace
             a.set<bool>(STR("InbAutoSize"), true).call(slot);
             if (g_log_tiles++ < kLogLimit)
             {
-                Output::send<LogLevel::Verbose>(STR("[FuserNative] tiles: label {} on {} (column top {}, style {})\n"), ours->GetName(), tile->GetName(), top,
+                Output::send<LogLevel::Verbose>(STR("[QoL] tiles: label {} on {} (column top {}, style {})\n"), ours->GetName(), tile->GetName(), top,
                                                 style ? style->GetName() : StringType{STR("none")});
             }
         }
@@ -3353,7 +3201,7 @@ namespace
         }
         catch (const std::exception& e)
         {
-            Output::send<LogLevel::Error>(STR("[FuserNative] tiles: exception {}\n"), to_wstring(e.what()));
+            Output::send<LogLevel::Error>(STR("[QoL] tiles: exception {}\n"), to_wstring(e.what()));
         }
     }
 
@@ -3366,7 +3214,7 @@ namespace
         static int logged = 0;
         if (logged++ < kLogLimit)
         {
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] tiles: library item {} -> '{}'\n"), item->GetName(), song ? song_name(song) : StringType{STR("no song")});
+            Output::send<LogLevel::Verbose>(STR("[QoL] tiles: library item {} -> '{}'\n"), item->GetName(), song ? song_name(song) : StringType{STR("no song")});
         }
         on_tile_song(tile, song);
     }
@@ -3383,7 +3231,7 @@ namespace
             show_tile_label(ours, e.song.Get(), e.style.Get());
             ++n;
         }
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] tiles: settings applied to {} labels\n"), n);
+        Output::send<LogLevel::Verbose>(STR("[QoL] tiles: settings applied to {} labels\n"), n);
     }
 
     // One stock list page's parts: the switcher child (CanvasPanel), its helper and pool, and the helper's ScrollBox.
@@ -3482,7 +3330,7 @@ namespace
         UObject* helper = create_widget(screen, tpl.helper->GetClassPrivate(), owning_player(screen));
         if (!canvas || !scroll || !pool || !helper)
         {
-            Output::send<LogLevel::Warning>(STR("[FuserNative] crate edit: creating a page failed (canvas {}, scroll {}, pool {}, helper {})\n"), canvas != nullptr,
+            Output::send<LogLevel::Warning>(STR("[QoL] crate edit: creating a page failed (canvas {}, scroll {}, pool {}, helper {})\n"), canvas != nullptr,
                                             scroll != nullptr, pool != nullptr, helper != nullptr);
             return nullptr;
         }
@@ -3504,7 +3352,7 @@ namespace
             c.set<UObject*>(STR("Content"), scroll).call(named);
             if (!fn || !named || widget_parent(scroll) != named)
             {
-                Output::send<LogLevel::Warning>(STR("[FuserNative] crate edit: placing {} in {}.ListContentSlot failed (SetContent {}, slot {}, parent {})\n"), scroll->GetName(),
+                Output::send<LogLevel::Warning>(STR("[QoL] crate edit: placing {} in {}.ListContentSlot failed (SetContent {}, slot {}, parent {})\n"), scroll->GetName(),
                                                 helper->GetName(), fn != nullptr, named != nullptr,
                                                 widget_parent(scroll) ? widget_parent(scroll)->GetName() : StringType{STR("null")});
                 return nullptr;
@@ -3522,7 +3370,7 @@ namespace
         }
         if (g_log_crate_edit++ < kLogLimit * 4)
         {
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] crate edit: page {} = [{}] like {} ({} helper settings copied; ListItemWidget {}, pool numItems {})\n"),
+            Output::send<LogLevel::Verbose>(STR("[QoL] crate edit: page {} = [{}] like {} ({} helper settings copied; ListItemWidget {}, pool numItems {})\n"),
                                             canvas->GetName(), child_names(canvas), tpl.canvas->GetName(), copied,
                                             obj_prop(helper, STR("ListItemWidget")) ? obj_prop(helper, STR("ListItemWidget"))->GetName() : StringType{STR("null")},
                                             int_prop(pool, STR("numItems"), -1));
@@ -3559,7 +3407,7 @@ namespace
         for (int32 t = 0; t < l.total(); ++t) pages_ok &= page_for_tab(screen, l, t) != nullptr;
         if (!switcher || n_tab_array != l.total() || n_types != l.total() || !pages_ok)
         {
-            Output::send<LogLevel::Warning>(STR("[FuserNative] crate edit: {} - unexpected layout (TabArray {}, UnlockableTypeByTabIndex {}, {} tabs, pages {}); not growing\n"), why,
+            Output::send<LogLevel::Warning>(STR("[QoL] crate edit: {} - unexpected layout (TabArray {}, UnlockableTypeByTabIndex {}, {} tabs, pages {}); not growing\n"), why,
                                             n_tab_array, n_types, l.total(), pages_ok);
             return false;
         }
@@ -3567,7 +3415,7 @@ namespace
         const PageParts moment_tpl = page_parts(screen, STR("EquippedMomentListHelper"), STR("EquippedMomentsListPool"), STR("MomentListScrollBox"));
         if (!song_tpl.ok() || !moment_tpl.ok())
         {
-            Output::send<LogLevel::Warning>(STR("[FuserNative] crate edit: {} - stock pages not found (songs {}, moments {}); not growing\n"), why, song_tpl.ok(), moment_tpl.ok());
+            Output::send<LogLevel::Warning>(STR("[QoL] crate edit: {} - stock pages not found (songs {}, moments {}); not growing\n"), why, song_tpl.ok(), moment_tpl.ok());
             return false;
         }
 
@@ -3608,7 +3456,7 @@ namespace
             c.call(tabs);
         }
         const TabLayout now = tab_layout(screen);
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] crate edit: {} - grew to {} song tabs, {} moment tabs{}; switcher [{}]; TabArray {}, UnlockableTypeByTabIndex {}, "
+        Output::send<LogLevel::Verbose>(STR("[QoL] crate edit: {} - grew to {} song tabs, {} moment tabs{}; switcher [{}]; TabArray {}, UnlockableTypeByTabIndex {}, "
                                             "buttons {} -> {}\n"),
                                         why, now.songs, now.moments, ok ? STR("") : STR(" WITH ERRORS"), child_names(switcher), array_num(tabs, STR("TabArray")),
                                         array_num(screen, STR("UnlockableTypeByTabIndex")), n_buttons, buttons ? buttons->Num() : -1);
@@ -3639,13 +3487,13 @@ namespace
         const TabLayout l = tab_layout(screen);
         const int32 songs = std::max(kStockSongTabs, tabs_for(want.songs, l.per));
         const int32 moments = std::max(1, tabs_for(want.moments, l.per));
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] crate edit: {} OnInitialized - provision songs {} moments {} ({}) -> {} song tabs, {} moment tabs; "
+        Output::send<LogLevel::Verbose>(STR("[QoL] crate edit: {} OnInitialized - provision songs {} moments {} ({}) -> {} song tabs, {} moment tabs; "
                                             "switcher children {}, TabArray {}, UnlockableTypeByTabIndex {}, _NumSongsTabs {}\n"),
                                         screen->GetName(), want.songs, want.moments, detail, songs, moments, child_count(obj_prop(screen, STR("TopListsSwitcher"))),
                                         array_num(obj_prop(screen, STR("TopTabs")), STR("TabArray")), array_num(screen, STR("UnlockableTypeByTabIndex")), l.songs);
         if (l.songs != kStockSongTabs || l.moments != 1 || child_count(obj_prop(screen, STR("TopListsSwitcher"))) != kStockTabs)
         {
-            Output::send<LogLevel::Warning>(STR("[FuserNative] crate edit: unexpected stock layout; leaving the screen unextended\n"));
+            Output::send<LogLevel::Warning>(STR("[QoL] crate edit: unexpected stock layout; leaving the screen unextended\n"));
             return;
         }
         ensure_tabs(screen, songs, moments, STR("OnInitialized"));
@@ -3660,88 +3508,13 @@ namespace
         }
         catch (const std::exception& e)
         {
-            Output::send<LogLevel::Error>(STR("[FuserNative] crate edit: exception {}\n"), to_wstring(e.what()));
+            Output::send<LogLevel::Error>(STR("[QoL] crate edit: exception {}\n"), to_wstring(e.what()));
         }
     }
 
     // ---------------------------------------------------------------- mod settings ----------------
-    // A "Key and BPM Display" dropdown row in the Settings screen's General tab, after
-    // ControllerPrompts. WBP_Screen_Settings' General tab is General_ScrollBox -> CanvasPanel_General (a
-    // VerticalBox) of designer-placed WBP_Setting_* rows; a WBP_Setting_Dropdown takes its label, entries and value
-    // through SetLabelContent / AddUniqueDropdownEntry / SetCurrentValue and reports a pick through
-    // OnDropdownSelectionChanged_Event_0 (bound to its DropdownMenu's delegate, so ProcessEvent-dispatched). Its
-    // Construct copies HypeListParent (a designer value) into the menu, so ours takes the Language row's.
-    // The value is kept in our settings.ini (g_keybpm_mode, above) and restored at every OnScreenActivated (one Settings
-    // screen instance serves every opening, freestyle's pause menu included).
-    FName g_name_settings{}, g_name_selection_changed{}, g_name_on_highlighted{}, g_name_on_unhighlighted{}, g_name_screen_activated{},
-            g_name_destruct{}, g_name_toggle_changed{};
-    FWeakObjectPtr g_settings_screen{}, g_settings_row{};
-    int g_log_settings = 0, g_log_hover = 0;
-
-    auto set_text_param(UObject* obj, const CharType* fn_name, const CharType* param, const CharType* text) -> bool
-    {
-        PCall c(own_fn(obj, fn_name));
-        const FText value(text); // engine copy through the property (as for the search box's hint text)
-        return c.copy_in(param, &value).call(obj);
-    }
-
-    // Insert `row` into VerticalBox `box` right after `after`: UMG has no Blueprint insert-at-index, so the rows after it
-    // are removed and re-added behind ours, each keeping its slot layout (remove and re-add).
-    auto insert_after(UObject* box, UObject* after, UObject* row) -> bool
-    {
-        const int32 at = child_index(box, after);
-        if (at < 0) return false;
-        std::vector<std::pair<UObject*, UObject*>> tail{}; // child, old slot
-        while (child_count(box) > at + 1)
-        {
-            UObject* c = child_at(box, at + 1);
-            tail.emplace_back(c, obj_prop(c, STR("Slot")));
-            if (!remove_child(box, c)) return false;
-        }
-        UObject* slot = add_child(box, row);
-        copy_slot_layout(obj_prop(after, STR("Slot")), slot);
-        for (auto& [c, old] : tail) copy_slot_layout(old, add_child(box, c));
-        return slot != nullptr;
-    }
-
-    // A dropdown row like `tpl` (a stock WBP_Setting_Dropdown) with our label and entries, inserted after `after`.
-    auto make_dropdown_row(UObject* screen, UObject* tpl, UObject* after, const CharType* label, std::initializer_list<const CharType*> options) -> UObject*
-    {
-        UObject* box = widget_parent(after);
-        UObject* row = box ? create_widget(screen, tpl->GetClassPrivate(), owning_player(screen)) : nullptr;
-        if (!row) return nullptr;
-        if (auto* dst = row->GetValuePtrByPropertyNameInChain<UObject*>(STR("HypeListParent"))) *dst = obj_prop(tpl, STR("HypeListParent"));
-        // The row class's defaults carry 4 graphics-quality entries (ours became entries 5 and 6): empty it first
-        ArrayView entries(array_prop(row, STR("_DropdownEntries")), row);
-        if (entries.ok())
-        {
-            for (int32 i = 0; i < entries.num(); ++i) entries.prop->GetInner()->DestroyValue(entries.at(i));
-            entries.raw->num = 0;
-        }
-        set_text_param(row, STR("SetLabelContent"), STR("in_LabelContent"), label);
-        for (const CharType* o : options) set_text_param(row, STR("AddUniqueDropdownEntry"), STR("NewDropdownOption"), o);
-        const bool placed = insert_after(box, after, row);
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: dropdown '{}' = {} ({} entries) placed {}\n"), label, row->GetName(), array_num(row, STR("_DropdownEntries")), placed);
-        return placed ? row : nullptr;
-    }
-
-    // A toggle row like `tpl` (a stock WBP_Setting_Toggle, whose On / Off labels it copies) inserted after `after`.
-    auto make_toggle_row(UObject* screen, UObject* tpl, UObject* after, const CharType* label) -> UObject*
-    {
-        UObject* box = widget_parent(after);
-        UObject* row = box ? create_widget(screen, tpl->GetClassPrivate(), owning_player(screen)) : nullptr;
-        if (!row) return nullptr;
-        for (const CharType* name : {STR("_OnLabel"), STR("_OffLabel")})
-        {
-            FProperty* f = find_field(tpl->GetClassPrivate(), name);
-            if (f) f->CopyCompleteValue(f->ContainerPtrToValuePtr<void>(row), f->ContainerPtrToValuePtr<void>(tpl));
-        }
-        if (auto* dst = row->GetValuePtrByPropertyNameInChain<UObject*>(STR("HypeListParent"))) *dst = obj_prop(tpl, STR("HypeListParent"));
-        set_text_param(row, STR("SetLabelContent"), STR("in_LabelContent"), label);
-        const bool placed = insert_after(box, after, row);
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: toggle '{}' = {} placed {}\n"), label, row->GetName(), placed);
-        return placed ? row : nullptr;
-    }
+    FName g_name_on_highlighted{}, g_name_on_unhighlighted{};
+    int g_log_hover = 0;
 
     // ---------------------------------------------------------------- new-crate slot sliders -------
     // "New Crate Song Slots" (24-144) and "New Crate Snapshot Slots" (0-120), in steps of 8, songs + snapshots <= 144.
@@ -3750,16 +3523,13 @@ namespace
     // GetDefaultCrateSongSlotsNum / ...MomentSlotsNum return CrateMgr+0x88 / +0x94, and CreateCustomCrate copies them
     // into each new crate), so a value goes to both: the HypeSettings CDO (read at CrateMgr's init, and by our tab
     // provisioning) and the live CrateMgr (checked against its getters first). Existing crates keep their own counts.
-    // WBP_Setting_Slider snaps by itself: _LabelGridSize grid-snaps the value on release and in its value text, and
-    // SetupNotchedBehavior (its Construct) turns the grid into notches. SetCurrentValueNonAlpha(v, IsInitializing =
-    // true) sets it without broadcasting.
+    // The two rows are on the Settings screen's Mods tab (register_settings).
     constexpr int32 kSlotStep = 8, kSlotCap = 144;
     constexpr int32 kSongSlotsMin = 24, kSongSlotsMax = kSlotCap, kMomentSlotsMin = 0, kMomentSlotsMax = kSlotCap - kSongSlotsMin;
     constexpr size_t kCrateMgrSongSlots = 0x88, kCrateMgrMomentSlots = 0x94;
-    FWeakObjectPtr g_row_songs{}, g_row_moments{}, g_crate_mgr{};
+    FWeakObjectPtr g_crate_mgr{};
     int32 g_slider_songs = -1, g_slider_moments = -1; // what the rows show
     bool g_crate_mgr_synced = false;
-    FName g_name_slider_value{};
 
     auto snap_slots(float v, int32 lo, int32 hi) -> int32
     {
@@ -3822,86 +3592,44 @@ namespace
         int32& moments = *reinterpret_cast<int32*>(raw + kCrateMgrMomentSlots);
         if (songs != got_songs || moments != got_moments)
         {
-            Output::send<LogLevel::Warning>(STR("[FuserNative] crate slots: CrateMgr +0x88/+0x94 = {}/{} but its getters say {}/{} - not written ({})\n"), songs, moments,
+            Output::send<LogLevel::Warning>(STR("[QoL] crate slots: CrateMgr +0x88/+0x94 = {}/{} but its getters say {}/{} - not written ({})\n"), songs, moments,
                                             got_songs, got_moments, when);
             return true; // don't retry a layout we don't trust
         }
         const int32 before_songs = songs, before_moments = moments;
         songs = g_new_crate_songs;
         moments = g_new_crate_moments;
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] crate slots ({}): new crates {} songs / {} snapshots (CrateMgr was {}/{}, getters now {}/{})\n"), when, songs,
+        Output::send<LogLevel::Verbose>(STR("[QoL] crate slots ({}): new crates {} songs / {} snapshots (CrateMgr was {}/{}, getters now {}/{})\n"), when, songs,
                                         moments, before_songs, before_moments, crate_mgr_getter(mgr, STR("GetDefaultCrateSongSlotsNum")),
                                         crate_mgr_getter(mgr, STR("GetDefaultCrateMomentSlotsNum")));
         return true;
     }
 
-    // The rows' starting values: ours if set, else the game's current ones - snapped, clamped and capped for display
-    auto init_slider_values() -> void
+    // The rows' defaults: the game's current values, snapped, clamped and capped
+    auto default_slots(int32& songs, int32& moments) -> void
     {
-        const int32 songs = g_new_crate_songs >= 0 ? g_new_crate_songs : cdo_slots(STR("DefaultCrateSongSlotsNum"));
-        const int32 moments = g_new_crate_moments >= 0 ? g_new_crate_moments : cdo_slots(STR("DefaultCrateMomentSlotsNum"));
-        g_slider_songs = snap_slots(static_cast<float>(songs < 0 ? kSongSlotsMin : songs), kSongSlotsMin, kSongSlotsMax);
-        g_slider_moments = snap_slots(static_cast<float>(moments < 0 ? kMomentSlotsMin : moments), kMomentSlotsMin, kMomentSlotsMax);
-        if (g_slider_songs + g_slider_moments > kSlotCap) g_slider_moments = kSlotCap - g_slider_songs;
+        const int32 s = cdo_slots(STR("DefaultCrateSongSlotsNum")), m = cdo_slots(STR("DefaultCrateMomentSlotsNum"));
+        songs = snap_slots(static_cast<float>(s < 0 ? kSongSlotsMin : s), kSongSlotsMin, kSongSlotsMax);
+        moments = snap_slots(static_cast<float>(m < 0 ? kMomentSlotsMin : m), kMomentSlotsMin, kMomentSlotsMax);
+        if (songs + moments > kSlotCap) moments = kSlotCap - songs;
     }
 
-    auto set_slider_value(UObject* row, int32 value) -> void
+    // A slot row's value (already on the row's steps). Raising one past the cap lowers the other by the overflow; a
+    // change saves both keys, so from then on both hold the pair.
+    auto on_slot_row(bool songs_row, int32 value, int flags) -> void
     {
-        PCall set(own_fn(row, STR("SetCurrentValueNonAlpha")));
-        set.set<float>(STR("in_NewValue"), static_cast<float>(value)).set<bool>(STR("IsInitializing"), true).call(row);
-    }
-
-    // A slider row like `tpl` (a stock WBP_Setting_Slider) over [lo, hi] in steps of kSlotStep, inserted after `after`.
-    auto make_slider_row(UObject* screen, UObject* tpl, UObject* after, const CharType* label, int32 lo, int32 hi, int32 value) -> UObject*
-    {
-        UObject* box = widget_parent(after);
-        UObject* row = box ? create_widget(screen, tpl->GetClassPrivate(), owning_player(screen)) : nullptr;
-        if (!row) return nullptr;
-        if (auto* dst = row->GetValuePtrByPropertyNameInChain<UObject*>(STR("HypeListParent"))) *dst = obj_prop(tpl, STR("HypeListParent"));
-        if (auto* grid = row->GetValuePtrByPropertyNameInChain<float>(STR("_LabelGridSize"))) *grid = static_cast<float>(kSlotStep);
-        if (auto* bias = row->GetValuePtrByPropertyNameInChain<float>(STR("LabelValueRoundingBias"))) *bias = 0.0f;
-        if (FProperty* units = find_field(row->GetClassPrivate(), STR("_UnitsText")))
-        {
-            const FText plain(STR("{Quantity}")); // the value text: just the number (the stock rows show e.g. a percentage)
-            units->CopyCompleteValue(units->ContainerPtrToValuePtr<void>(row), &plain);
-        }
-        set_text_param(row, STR("SetLabelContent"), STR("in_LabelContent"), label);
-        PCall extents(own_fn(row, STR("SetLabelExtents")));
-        extents.set<float>(STR("in_MinLabelValue"), static_cast<float>(lo)).set<float>(STR("in_MaxLabelValue"), static_cast<float>(hi)).call(row);
-        PCall reset(own_fn(row, STR("OverrideDoubleClickToResetSlider")));
-        reset.set<bool>(STR("DoubleClickToReset"), false).call(row); // no meaningful stock value to reset to
-        const bool placed = insert_after(box, after, row);          // Construct -> SetupNotchedBehavior with our grid
-        PCall values(own_fn(row, STR("SetSliderValuesNonAlpha")));
-        values.set<float>(STR("MinNonAlpha"), static_cast<float>(lo))
-                .set<float>(STR("MaxNonAlpha"), static_cast<float>(hi))
-                .set<float>(STR("DefaultValueNonAlpha"), static_cast<float>(value))
-                .set<float>(STR("CurrentValueNonAlpha"), static_cast<float>(value))
-                .set<bool>(STR("IsInitializing"), true)
-                .call(row);
-        PCall notches(own_fn(row, STR("SetupNotchedBehavior")));
-        notches.call(row); // again, in case Construct ran before the grid was set
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: slider '{}' = {} [{}..{} step {}] value {} placed {}\n"), label, row->GetName(), lo, hi, kSlotStep, value,
-                                        placed);
-        return placed ? row : nullptr;
-    }
-
-    // A slider moved (HypeSliderValueChanged, alpha 0..1, while dragging or stepping)
-    auto on_slot_slider(bool songs_row, float alpha) -> void
-    {
-        const int32 lo = songs_row ? kSongSlotsMin : kMomentSlotsMin, hi = songs_row ? kSongSlotsMax : kMomentSlotsMax;
-        const int32 v = snap_slots(static_cast<float>(lo) + alpha * static_cast<float>(hi - lo), lo, hi);
         int32& mine = songs_row ? g_slider_songs : g_slider_moments;
         int32& other = songs_row ? g_slider_moments : g_slider_songs;
-        if (v == mine && g_new_crate_songs >= 0) return;
-        mine = v;
-        if (mine + other > kSlotCap)
+        mine = value;
+        if (flags & FNL_SETTING_INITIAL)
         {
-            other = kSlotCap - mine; // lowered by the overflow, 8 per notch past the cap
-            if (UObject* row = (songs_row ? g_row_moments : g_row_songs).Get()) set_slider_value(row, other);
+            (songs_row ? g_new_crate_songs : g_new_crate_moments) = (flags & FNL_SETTING_SAVED) ? value : -1;
+            return;
         }
+        if (mine + other > kSlotCap) other = kSlotCap - mine; // lowered by the overflow, 8 per notch past the cap
+        g_api->set_setting(g_self, songs_row ? "NewCrateSnapshotSlots" : "NewCrateSongSlots", other);
         g_new_crate_songs = g_slider_songs;
         g_new_crate_moments = g_slider_moments;
-        save_settings();
         apply_new_crate_slots(STR("Settings"));
     }
 
@@ -3913,135 +3641,6 @@ namespace
         g_crate_mgr_synced = apply_new_crate_slots(STR("startup"));
     }
 
-    FWeakObjectPtr g_row_key_labels{}, g_row_search{}, g_row_download{}, g_row_download_mix{}, g_row_send{}, g_row_send_kbps{}, g_row_send_max{};
-
-    // The Upload Speed Limit row's entry for a cap: the nearest option.
-    auto send_kbps_index(int32 kbps) -> int32
-    {
-        int32 best = 0;
-        for (int32 i = 1; i < static_cast<int32>(std::size(kSendKbpsOptions)); ++i)
-            if (std::abs(kSendKbpsOptions[i] - kbps) < std::abs(kSendKbpsOptions[best] - kbps)) best = i;
-        return best;
-    }
-
-    // The two upload rows only matter while Send Songs to Other Players is on: greyed out (UWidget::SetIsEnabled)
-    // otherwise.
-    auto apply_send_rows_enabled() -> void
-    {
-        for (UObject* row : {g_row_send_kbps.Get(), g_row_send_max.Get()})
-        {
-            if (!row) continue;
-            PCall enable(own_fn(row, STR("SetIsEnabled")));
-            enable.set<bool>(STR("bInIsEnabled"), g_send_songs).call(row);
-        }
-    }
-
-    // Our rows, after ControllerPrompts in General: Key and BPM Display, Key Labels, Song Search Bar, the two crate-slot
-    // sliders, then Download Songs, Download Mix Songs, Send Songs to Other Players, Upload Speed Limit and
-    // Simultaneous Uploads.
-    auto inject_settings_row(UObject* screen) -> void
-    {
-        UObject* language = obj_prop(screen, STR("Language"));
-        UObject* prompts = obj_prop(screen, STR("ControllerPrompts"));
-        UObject* toggle_tpl = obj_prop(screen, STR("SubtitlesSetting"));
-        if (!language || !prompts || !toggle_tpl || !widget_parent(prompts))
-        {
-            Output::send<LogLevel::Warning>(STR("[FuserNative] settings: Language {} / ControllerPrompts {} / SubtitlesSetting {} / General box missing\n"), language != nullptr,
-                                            prompts != nullptr, toggle_tpl != nullptr);
-            return;
-        }
-        UObject* keybpm = make_dropdown_row(screen, language, prompts, STR("Key and BPM Display"), {STR("On idle"), STR("On hover"), STR("Off")});
-        UObject* labels = keybpm ? make_dropdown_row(screen, language, keybpm, STR("Key Labels"), {STR("Flats"), STR("Sharps"), STR("Both")}) : nullptr;
-        UObject* search = labels ? make_toggle_row(screen, toggle_tpl, labels, STR("Song Search Bar")) : nullptr;
-        UObject* slider_tpl = obj_prop(screen, STR("ScrollSpeedSlider"));
-        init_slider_values();
-        UObject* songs = search && slider_tpl ? make_slider_row(screen, slider_tpl, search, STR("New Crate Song Slots"), kSongSlotsMin, kSongSlotsMax, g_slider_songs) : nullptr;
-        UObject* moments = songs ? make_slider_row(screen, slider_tpl, songs, STR("New Crate Snapshot Slots"), kMomentSlotsMin, kMomentSlotsMax, g_slider_moments) : nullptr;
-        UObject* tail = moments ? moments : search; // the sliders need ScrollSpeedSlider; without it these follow the search toggle
-        UObject* download = tail ? make_dropdown_row(screen, language, tail, STR("Download Songs"), {STR("No"), STR("Temporarily"), STR("Permanently")}) : nullptr;
-        UObject* download_mix = download ? make_dropdown_row(screen, language, download, STR("Download Mix Songs"), {STR("No"), STR("Temporarily"), STR("Permanently")})
-                                         : nullptr;
-        UObject* send = download_mix ? make_toggle_row(screen, toggle_tpl, download_mix, STR("Send Songs to Other Players")) : nullptr;
-        UObject* send_kbps = send ? make_dropdown_row(screen, language, send, STR("Upload Speed Limit"),
-                                                      {STR("256 KB/s"), STR("512 KB/s"), STR("1 MB/s"), STR("2 MB/s"), STR("4 MB/s")})
-                                  : nullptr;
-        UObject* send_max = send_kbps ? make_dropdown_row(screen, language, send_kbps, STR("Simultaneous Uploads"), {STR("1"), STR("2"), STR("3"), STR("4")}) : nullptr;
-        g_row_download = FWeakObjectPtr(download);
-        g_row_download_mix = FWeakObjectPtr(download_mix);
-        g_row_send = FWeakObjectPtr(send);
-        g_row_send_kbps = FWeakObjectPtr(send_kbps);
-        g_row_send_max = FWeakObjectPtr(send_max);
-        g_row_songs = FWeakObjectPtr(songs);
-        g_row_moments = FWeakObjectPtr(moments);
-        g_settings_row = FWeakObjectPtr(keybpm);
-        g_row_key_labels = FWeakObjectPtr(labels);
-        g_row_search = FWeakObjectPtr(search);
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: General = [{}]\n"), child_names(widget_parent(prompts)));
-    }
-    auto set_row_value(UObject* row, int32 index, const CharType* when) -> void
-    {
-        PCall set(own_fn(row, STR("SetCurrentValue")));
-        set.set<float>(STR("in_NewValue"), static_cast<float>(index)).set<bool>(STR("IsInitializing"), true).call(row);
-        PCall get(own_fn(row, STR("GetCurrentValue")));
-        get.call(row);
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: {} - SetCurrentValue({}) -> GetCurrentValue {:.0f}\n"), when, index, get.get<float>(STR("ReturnValue")));
-    }
-
-    auto on_settings_event(UObject* screen, const FName& name) -> void
-    {
-        if (g_log_settings++ < kLogLimit * 4)
-        {
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: {} {} (row {})\n"), screen->GetName(), name.ToString(),
-                                            g_settings_row.Get() ? g_settings_row.Get()->GetName() : StringType{STR("none")});
-        }
-        if (name == g_name_on_initialized)
-        {
-            g_settings_screen = FWeakObjectPtr(screen);
-            inject_settings_row(screen);
-        }
-        else if (name == g_name_screen_activated)
-        {
-            if (UObject* row = g_settings_row.Get()) set_row_value(row, g_keybpm_mode, STR("Key and BPM Display"));
-            if (UObject* row = g_row_key_labels.Get()) set_row_value(row, g_key_labels, STR("Key Labels"));
-            if (UObject* row = g_row_search.Get())
-            {
-                // As the stock screen does for its toggles (Subtitles, Crossplay, HDR): InitializeToggleState also runs the
-                // switch's InitializeGenericToggleState, which snaps its graphic; SetCurrentValue left the switch showing
-                // off under an "On" label until the first click.
-                PCall init(own_fn(row, STR("InitializeToggleState")));
-                init.set<bool>(STR("inToggled"), g_search_enabled).call(row);
-                Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: Song Search Bar - InitializeToggleState({})\n"), g_search_enabled);
-            }
-            init_slider_values();
-            if (UObject* row = g_row_songs.Get()) set_slider_value(row, g_slider_songs);
-            if (UObject* row = g_row_moments.Get()) set_slider_value(row, g_slider_moments);
-            if (UObject* row = g_row_download.Get()) set_row_value(row, g_download_songs, STR("Download Songs"));
-            if (UObject* row = g_row_download_mix.Get()) set_row_value(row, g_download_mix_songs, STR("Download Mix Songs"));
-            if (UObject* row = g_row_send.Get())
-            {
-                PCall init(own_fn(row, STR("InitializeToggleState"))); // as for Song Search Bar, above
-                init.set<bool>(STR("inToggled"), g_send_songs).call(row);
-                Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: Send Songs to Other Players - InitializeToggleState({})\n"), g_send_songs);
-            }
-            if (UObject* row = g_row_send_kbps.Get()) set_row_value(row, send_kbps_index(g_send_kbps), STR("Upload Speed Limit"));
-            if (UObject* row = g_row_send_max.Get()) set_row_value(row, g_send_max - kSendMaxMin, STR("Simultaneous Uploads"));
-            apply_send_rows_enabled();
-        }
-    }
-
-    auto dump_settings() -> void
-    {
-        UObject* row = g_settings_row.Get();
-        UObject* screen = g_settings_screen.Get();
-        if (!row || !screen) return;
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] F8: settings row {}\n"), layout_desc(row));
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] F8:   ControllerPrompts {}\n"), layout_desc(obj_prop(screen, STR("ControllerPrompts"))));
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] F8:   row's DropdownMenu {} (HypeListDropdownParent {})\n"), layout_desc(obj_prop(row, STR("DropdownMenu"))),
-                                        obj_prop(obj_prop(row, STR("DropdownMenu")), STR("HypeListDropdownParent"))
-                                                ? obj_prop(obj_prop(row, STR("DropdownMenu")), STR("HypeListDropdownParent"))->GetName()
-                                                : StringType{STR("null")});
-    }
-
     auto on_process_event_post(UObject* context, UFunction* fn, void* parms) -> void
     {
         if (!context || !fn) return;
@@ -4051,112 +3650,12 @@ namespace
             on_crate_edit_initialized(context);
             return;
         }
-        if ((name == g_name_on_initialized || name == g_name_construct || name == g_name_destruct || name == g_name_screen_activated) &&
-            context->GetClassPrivate()->GetFName() == g_name_settings)
-        {
-            try
-            {
-                on_settings_event(context, name);
-            }
-            catch (const std::exception& e)
-            {
-                Output::send<LogLevel::Error>(STR("[FuserNative] settings: exception {}\n"), to_wstring(e.what()));
-            }
-            return;
-        }
-        if (name == g_name_selection_changed)
-        {
-            FProperty* p = find_param(fn, STR("SelectedIndex"));
-            const int32 index = p ? *p->ContainerPtrToValuePtr<int32>(parms) : -1;
-            const bool ours = context == g_settings_row.Get();
-            if (ours || g_log_settings++ < kLogLimit * 4)
-            {
-                Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: {} selection -> {} ({})\n"), context->GetName(), index, ours ? STR("OUR ROW") : STR("stock row"));
-            }
-            if (ours && index >= kKeyBpmOnIdle && index <= kKeyBpmOff && index != g_keybpm_mode)
-            {
-                g_keybpm_mode = index;
-                save_settings();
-                apply_keybpm_mode_to_all();
-                apply_to_tile_labels();
-            }
-            if (context == g_row_key_labels.Get() && index >= kKeyLabelsFlats && index <= kKeyLabelsBoth && index != g_key_labels)
-            {
-                g_key_labels = index;
-                save_settings();
-                apply_key_labels_to_all();
-                apply_to_tile_labels();
-            }
-            // Download Songs: FUSERMultiplayer.dll reads DownloadSongs from the file, so saving is all it takes
-            if (context == g_row_download.Get() && index >= kDownloadNo && index <= kDownloadPermanently && index != g_download_songs)
-            {
-                g_download_songs = index;
-                save_settings();
-                Output::send<LogLevel::Normal>(STR("[FuserNative] settings: Download Songs -> {}\n"),
-                                               index == kDownloadNo ? STR("No") : index == kDownloadTemporarily ? STR("Temporarily") : STR("Permanently"));
-            }
-            // Download Mix Songs: read from the file the same way, when a shared mix is played
-            if (context == g_row_download_mix.Get() && index >= kDownloadNo && index <= kDownloadPermanently && index != g_download_mix_songs)
-            {
-                g_download_mix_songs = index;
-                save_settings();
-                Output::send<LogLevel::Normal>(STR("[FuserNative] settings: Download Mix Songs -> {}\n"),
-                                               index == kDownloadNo ? STR("No") : index == kDownloadTemporarily ? STR("Temporarily") : STR("Permanently"));
-            }
-            // Upload Speed Limit / Simultaneous Uploads: saved; FUSERMultiplayer.dll reads them for the next transfer
-            if (context == g_row_send_kbps.Get() && index >= 0 && index < static_cast<int32>(std::size(kSendKbpsOptions)) &&
-                kSendKbpsOptions[index] != g_send_kbps)
-            {
-                g_send_kbps = kSendKbpsOptions[index];
-                save_settings();
-                Output::send<LogLevel::Normal>(STR("[FuserNative] settings: Upload Speed Limit -> {} KB/s\n"), g_send_kbps);
-            }
-            if (context == g_row_send_max.Get() && index >= 0 && index <= kSendMaxMax - kSendMaxMin && index + kSendMaxMin != g_send_max)
-            {
-                g_send_max = index + kSendMaxMin;
-                save_settings();
-                Output::send<LogLevel::Normal>(STR("[FuserNative] settings: Simultaneous Uploads -> {}\n"), g_send_max);
-            }
-            return;
-        }
-        if (name == g_name_slider_value && (context == g_row_songs.Get() || context == g_row_moments.Get()))
-        {
-            FProperty* p = find_param(fn, STR("newValue"));
-            if (p) on_slot_slider(context == g_row_songs.Get(), *p->ContainerPtrToValuePtr<float>(parms));
-            return;
-        }
-        if (name == g_name_toggle_changed && context == g_row_send.Get())
-        {
-            FProperty* p = find_param(fn, STR("isToggled"));
-            const bool on = p && static_cast<FBoolProperty*>(p)->GetPropertyValue(p->ContainerPtrToValuePtr<void>(parms));
-            if (on != g_send_songs)
-            {
-                g_send_songs = on;
-                save_settings();
-                apply_send_rows_enabled();
-                Output::send<LogLevel::Normal>(STR("[FuserNative] settings: Send Songs to Other Players -> {}\n"), on ? STR("Yes") : STR("No"));
-            }
-            return;
-        }
-        if (name == g_name_toggle_changed && context == g_row_search.Get())
-        {
-            FProperty* p = find_param(fn, STR("isToggled"));
-            const bool on = p && static_cast<FBoolProperty*>(p)->GetPropertyValue(p->ContainerPtrToValuePtr<void>(parms));
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: Song Search Bar toggled -> {}\n"), on);
-            if (on != g_search_enabled)
-            {
-                g_search_enabled = on;
-                save_settings();
-                apply_search_setting();
-            }
-            return;
-        }
         if ((name == g_name_on_highlighted || name == g_name_on_unhighlighted) && context->GetClassPrivate()->GetFName() == g_name_diamond)
         {
             if (g_log_hover++ < kLogLimit)
             {
                 auto* hw = context->GetValuePtrByPropertyNameInChain<bool>(STR("IsHighlighted"));
-                Output::send<LogLevel::Verbose>(STR("[FuserNative] hover: {} {} (IsHighlighted {})\n"), context->GetName(), name.ToString(), hw && *hw);
+                Output::send<LogLevel::Verbose>(STR("[QoL] hover: {} {} (IsHighlighted {})\n"), context->GetName(), name.ToString(), hw && *hw);
             }
             try
             {
@@ -4164,7 +3663,7 @@ namespace
             }
             catch (const std::exception& e)
             {
-                Output::send<LogLevel::Error>(STR("[FuserNative] hover: exception {}\n"), to_wstring(e.what()));
+                Output::send<LogLevel::Error>(STR("[QoL] hover: exception {}\n"), to_wstring(e.what()));
             }
             return;
         }
@@ -4176,7 +3675,7 @@ namespace
             }
             catch (const std::exception& e)
             {
-                Output::send<LogLevel::Error>(STR("[FuserNative] tiles: exception {}\n"), to_wstring(e.what()));
+                Output::send<LogLevel::Error>(STR("[QoL] tiles: exception {}\n"), to_wstring(e.what()));
             }
             return;
         }
@@ -4192,7 +3691,7 @@ namespace
             }
             catch (const std::exception& e)
             {
-                Output::send<LogLevel::Error>(STR("[FuserNative] search: exception {}\n"), to_wstring(e.what()));
+                Output::send<LogLevel::Error>(STR("[QoL] search: exception {}\n"), to_wstring(e.what()));
             }
             return;
         }
@@ -4229,7 +3728,7 @@ namespace
 
         const bool match = key == expect.key && mode == expect.mode && bpm == expect.bpm && found == expect.found &&
                            text == key_text_for(expect);
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] {} '{}': Key={} Mode={} Bpm={} Found={} KeyText='{}' | expected {} {} {} {} '{}' -> {}\n"),
+        Output::send<LogLevel::Verbose>(STR("[QoL] {} '{}': Key={} Mode={} Bpm={} Found={} KeyText='{}' | expected {} {} {} {} '{}' -> {}\n"),
                                         phase, song_name(song), key, mode, bpm, found, text,
                                         expect.key, expect.mode, expect.bpm, expect.found, key_text_for(expect),
                                         match ? STR("MATCH") : STR("differs"));
@@ -4270,12 +3769,12 @@ namespace
         {
             if (!load_class(kLibClassPath))
             {
-                Output::send<LogLevel::Warning>(STR("[FuserNative] F6: BPL_FuserNative not loaded (see the load: line above)\n"));
+                Output::send<LogLevel::Warning>(STR("[QoL] F6: BPL_FuserNative not loaded (see the load: line above)\n"));
                 return;
             }
         }
         const auto songs = test_songs();
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] F6: {} test songs; bound={}\n"), songs.size(), g_bound);
+        Output::send<LogLevel::Verbose>(STR("[QoL] F6: {} test songs; bound={}\n"), songs.size(), g_bound);
         if (!was_bound)
         {
             for (UObject* s : songs) call_and_log(STR("BEFORE bind"), s);
@@ -4286,19 +3785,19 @@ namespace
         // Script-call path: WBP_FuserKeyBpm.SetSong's own bytecode calls the library functions
         if (!g_widget_class || !g_fn_set_song)
         {
-            Output::send<LogLevel::Warning>(STR("[FuserNative] F6: WBP_FuserKeyBpm not available; script-call test skipped\n"));
+            Output::send<LogLevel::Warning>(STR("[QoL] F6: WBP_FuserKeyBpm not available; script-call test skipped\n"));
             return;
         }
         UObject* world = any_world();
         UObject* test = world ? create_widget(world, g_widget_class, nullptr) : nullptr;
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] F6: test widget {} in {}\n"), test ? test->GetFullName() : StringType{STR("CREATE FAILED")},
+        Output::send<LogLevel::Verbose>(STR("[QoL] F6: test widget {} in {}\n"), test ? test->GetFullName() : StringType{STR("CREATE FAILED")},
                                         world ? world->GetFullName() : StringType{STR("no world")});
         if (!test) return;
         for (UObject* s : songs)
         {
             set_song(test, s, nullptr);
             const SongKeyBpm expect = compute_key_bpm(s);
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] script-call '{}': KeyBpmText='{}' (expected key '{}', bpm {})\n"), song_name(s),
+            Output::send<LogLevel::Verbose>(STR("[QoL] script-call '{}': KeyBpmText='{}' (expected key '{}', bpm {})\n"), song_name(s),
                                             text_of(obj_prop(test, STR("KeyBpmText"))), key_text_for(expect), expect.bpm);
         }
     }
@@ -4308,13 +3807,13 @@ namespace
     {
         std::vector<UObject*> songs{};
         UObjectGlobals::FindAllOf(STR("CelSongSet"), songs);
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] probe: {} CelSongSet instances\n"), songs.size());
+        Output::send<LogLevel::Verbose>(STR("[QoL] probe: {} CelSongSet instances\n"), songs.size());
         int shown = 0;
         for (UObject* song : songs)
         {
             if (!song || shown++ >= 8) break;
             const SongKeyBpm r = compute_key_bpm(song);
-            Output::send<LogLevel::Verbose>(STR("[FuserNative]  '{}': Key={} Mode={} Bpm={} Found={} '{}'\n"),
+            Output::send<LogLevel::Verbose>(STR("[QoL]  '{}': Key={} Mode={} Bpm={} Found={} '{}'\n"),
                                             song_name(song), r.key, r.mode, r.bpm, r.found, key_text_for(r));
         }
     }
@@ -4338,9 +3837,65 @@ namespace
 #endif
     }
 
+    // The mod's rows on the Settings screen's Mods tab (FnlApi::add_setting). Each value arrives at once
+    // (FNL_SETTING_INITIAL: only the variable is set, nothing is on screen yet), then with every change.
+    auto register_settings() -> void
+    {
+        auto add = [](const FnlSetting& s) { g_api->add_setting(g_self, &s); };
+        static const CharType* const keybpm_names[] = {STR("On idle"), STR("On hover"), STR("Off")};
+        static const CharType* const label_names[] = {STR("Flats"), STR("Sharps"), STR("Both")};
+        auto row = [](const char* key, const CharType* label, FnlSettingKind kind, int32 def, void (*on_change)(void*, int32_t, int)) {
+            FnlSetting s{};
+            s.size = sizeof(s);
+            s.key = key;
+            s.label = label;
+            s.kind = kind;
+            s.default_value = def;
+            s.on_change = on_change;
+            return s;
+        };
+
+        FnlSetting keybpm = row("KeyBpmDisplay", STR("Key and BPM Display"), FNL_SETTING_CHOICE, kKeyBpmDefault, [](void*, int32_t v, int flags) {
+            g_keybpm_mode = v;
+            if (flags & FNL_SETTING_INITIAL) return;
+            apply_keybpm_mode_to_all();
+            apply_to_tile_labels();
+        });
+        keybpm.choices = keybpm_names;
+        keybpm.choice_count = 3;
+        add(keybpm);
+
+        FnlSetting labels = row("KeyLabels", STR("Key Labels"), FNL_SETTING_CHOICE, kKeyLabelsFlats, [](void*, int32_t v, int flags) {
+            g_key_labels = v;
+            if (flags & FNL_SETTING_INITIAL) return;
+            apply_key_labels_to_all();
+            apply_to_tile_labels();
+        });
+        labels.choices = label_names;
+        labels.choice_count = 3;
+        add(labels);
+
+        add(row("SearchBar", STR("Song Search Bar"), FNL_SETTING_TOGGLE, 1, [](void*, int32_t v, int flags) {
+            g_search_enabled = v != 0;
+            if (!(flags & FNL_SETTING_INITIAL)) apply_search_setting();
+        }));
+
+        int32 songs = 0, moments = 0;
+        default_slots(songs, moments);
+        FnlSetting song_slots = row("NewCrateSongSlots", STR("New Crate Song Slots"), FNL_SETTING_SLIDER, songs,
+                                    [](void*, int32_t v, int flags) { on_slot_row(true, v, flags); });
+        song_slots.min = kSongSlotsMin, song_slots.max = kSongSlotsMax, song_slots.step = kSlotStep;
+        add(song_slots);
+        FnlSetting moment_slots = row("NewCrateSnapshotSlots", STR("New Crate Snapshot Slots"), FNL_SETTING_SLIDER, moments,
+                                      [](void*, int32_t v, int flags) { on_slot_row(false, v, flags); });
+        moment_slots.min = kMomentSlotsMin, moment_slots.max = kMomentSlotsMax, moment_slots.step = kSlotStep;
+        add(moment_slots);
+    }
+
     auto fusernative_unreal_init() -> void
     {
-        load_settings();
+        load_ini_settings();
+        register_settings();
         g_name_setup_song = FName(STR("SetupLayoutForSong"), FNAME_Add);
         g_name_setup_moment = FName(STR("SetupLayoutForMoment"), FNAME_Add);
         g_name_diamond = FName(STR("WBP_SongItem_Horizontal_Diamond_C"), FNAME_Add);
@@ -4353,20 +3908,15 @@ namespace
         g_name_song_tile = FName(STR("WBP_Element_Collection_Browse_HypeSongWidget_C"), FNAME_Add);
         g_name_song_grid_item = FName(STR("WBP_GridItem_Collection_Browse_Song_C"), FNAME_Add);
         g_name_list_item_initialized = FName(STR("OnListItemInitialized"), FNAME_Add);
-        g_name_settings = FName(STR("WBP_Screen_Settings_C"), FNAME_Add);
-        g_name_selection_changed = FName(STR("OnDropdownSelectionChanged_Event_0"), FNAME_Add);
         g_name_on_highlighted = FName(STR("OnHighlighted"), FNAME_Add);
         g_name_on_unhighlighted = FName(STR("OnUnhighlighted"), FNAME_Add);
-        g_name_screen_activated = FName(STR("OnScreenActivated"), FNAME_Add);
-        g_name_destruct = FName(STR("Destruct"), FNAME_Add);
-        g_name_toggle_changed = FName(STR("BndEvt__WBP_Component_ToggleSwitch_Generic_K2Node_ComponentBoundEvent_1_OnToggleStateChanged__DelegateSignature"), FNAME_Add);
-        g_name_slider_value = FName(STR("BndEvt__Slider_Contrast_K2Node_ComponentBoundEvent_1_HypeSliderValueChanged__DelegateSignature"), FNAME_Add);
         // our new-crate slot counts into the HypeSettings CDO before CrateMgr's init copies it (the live CrateMgr is
         // also written once it exists: crate_slots_tick)
         if (g_new_crate_songs >= 0 && g_new_crate_moments >= 0)
         {
-            g_new_crate_songs = snap_slots(static_cast<float>(g_new_crate_songs), kSongSlotsMin, kSongSlotsMax);
-            g_new_crate_moments = snap_slots(static_cast<float>(g_new_crate_moments), kMomentSlotsMin, std::min(kMomentSlotsMax, kSlotCap - g_new_crate_songs));
+            g_new_crate_songs = g_slider_songs = snap_slots(static_cast<float>(g_new_crate_songs), kSongSlotsMin, kSongSlotsMax);
+            g_new_crate_moments = g_slider_moments =
+                    snap_slots(static_cast<float>(g_new_crate_moments), kMomentSlotsMin, std::min(kMomentSlotsMax, kSlotCap - g_new_crate_songs));
             apply_new_crate_slots(STR("unreal-init"));
         }
         g_name_get_list_data = FName(STR("Get List Data for Tab Type"), FNAME_Add);
@@ -4379,18 +3929,14 @@ namespace
                     debug_keys();
                     if (g_bind_test_requested.exchange(false)) bind_and_test();
                     if (g_probe_requested.exchange(false)) probe_songs();
-                    if (g_crate_edit_dump_requested.exchange(false))
-                    {
-                        dump_crate_edit();
-                        dump_settings();
-                    }
+                    if (g_crate_edit_dump_requested.exchange(false)) dump_crate_edit();
                     if (g_tick == 0)
                     {
                         // BPL_FuserNative + WBP_FuserKeyBpm: a synchronous load, done while the game is still loading
                         // rather than when the first HUD song item appears
                         const double t0 = now_ms();
                         const bool ok = ensure_ready();
-                        Output::send<LogLevel::Verbose>(STR("[FuserNative] preload: key/BPM classes {} ({:.1f} ms)\n"), ok ? STR("ready") : STR("NOT ready"), now_ms() - t0);
+                        Output::send<LogLevel::Verbose>(STR("[QoL] preload: key/BPM classes {} ({:.1f} ms)\n"), ok ? STR("ready") : STR("NOT ready"), now_ms() - t0);
                     }
                     setup_tick();
                     if (g_tick % 300 == 150) clamp_song_genres(STR("sweep")); // songs loaded since (see clamp_song_genres)
@@ -4403,7 +3949,7 @@ namespace
                         swap_tick();
                         const double ms = now_ms() - t0;
                         if (ms > 4.0 && slow++ < kLogLimit)
-                            Output::send<LogLevel::Verbose>(STR("[FuserNative] swap_tick: {:.1f} ms ({} items tracked) at tick {}\n"), ms, g_swaps.size(), g_tick);
+                            Output::send<LogLevel::Verbose>(STR("[QoL] swap_tick: {:.1f} ms ({} items tracked) at tick {}\n"), ms, g_swaps.size(), g_tick);
                     }
                 },
                 {false, false, STR("FuserNative"), STR("GameThreadActions")});
@@ -4416,54 +3962,56 @@ namespace
         if (UFunction* set_padding = find_fn(STR("/Script/UMG.VerticalBoxSlot:SetPadding")))
         {
             UObjectGlobals::RegisterHook(set_padding, [](UnrealScriptFunctionCallableContext&, void*) {}, &on_set_padding_post, nullptr);
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] on_unreal_init: VerticalBoxSlot::SetPadding post-hook registered\n"));
+            Output::send<LogLevel::Verbose>(STR("[QoL] on_unreal_init: VerticalBoxSlot::SetPadding post-hook registered\n"));
         }
         else
         {
-            Output::send<LogLevel::Warning>(STR("[FuserNative] on_unreal_init: VerticalBoxSlot::SetPadding not found; hover mirroring disabled\n"));
+            Output::send<LogLevel::Warning>(STR("[QoL] on_unreal_init: VerticalBoxSlot::SetPadding not found; hover mirroring disabled\n"));
         }
         if (UFunction* key_text = find_fn(STR("/Script/Hype.HypeBPFL:GetHypeKeyText")))
         {
             UObjectGlobals::RegisterHook(key_text, [](UnrealScriptFunctionCallableContext&, void*) {}, &on_key_text_post, nullptr);
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] on_unreal_init: HypeBPFL::GetHypeKeyText post-hook registered (Key Labels)\n"));
+            Output::send<LogLevel::Verbose>(STR("[QoL] on_unreal_init: HypeBPFL::GetHypeKeyText post-hook registered (Key Labels)\n"));
         }
         for (const CharType* path : {STR("/Script/Hype.HypeEditableTextWidget:_OnTextChanged"), STR("/Script/Hype.CelMgr:Sort"), STR("/Script/Hype.CelMgr:SortSoftPtrs")})
         {
             UFunction* f = find_fn(path);
             if (!f)
             {
-                Output::send<LogLevel::Warning>(STR("[FuserNative] on_unreal_init: {} not found; song search disabled\n"), path);
+                Output::send<LogLevel::Warning>(STR("[QoL] on_unreal_init: {} not found; song search disabled\n"), path);
                 continue;
             }
             const bool is_text = f->GetFName() == FName(STR("_OnTextChanged"), FNAME_Add);
             UObjectGlobals::RegisterHook(f, [](UnrealScriptFunctionCallableContext&, void*) {}, is_text ? &on_text_changed_post : &on_sort_post, nullptr);
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] on_unreal_init: {} post-hook registered\n"), path);
+            Output::send<LogLevel::Verbose>(STR("[QoL] on_unreal_init: {} post-hook registered\n"), path);
         }
         if (UFunction* set_song_set = find_fn(STR("/Script/Hype.HypeSongWidget:SetCelSongSet")))
         {
             UObjectGlobals::RegisterHook(set_song_set, [](UnrealScriptFunctionCallableContext&, void*) {}, &on_set_cel_song_set_post, nullptr);
-            Output::send<LogLevel::Verbose>(STR("[FuserNative] on_unreal_init: HypeSongWidget::SetCelSongSet post-hook registered (song tile key/BPM)\n"));
+            Output::send<LogLevel::Verbose>(STR("[QoL] on_unreal_init: HypeSongWidget::SetCelSongSet post-hook registered (song tile key/BPM)\n"));
         }
         else
         {
-            Output::send<LogLevel::Warning>(STR("[FuserNative] on_unreal_init: HypeSongWidget::SetCelSongSet not found; song tile key/BPM disabled\n"));
+            Output::send<LogLevel::Warning>(STR("[QoL] on_unreal_init: HypeSongWidget::SetCelSongSet not found; song tile key/BPM disabled\n"));
         }
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] on_unreal_init: game-thread actions + SetupLayoutForSong post-hook registered\n"));
+        Output::send<LogLevel::Verbose>(STR("[QoL] on_unreal_init: game-thread actions + SetupLayoutForSong post-hook registered\n"));
     }
 } // namespace
 
-// Called by the loader once fue is up (fnl_start); everything else runs from fue's first GameEngine::Tick.
-auto fusernative_start() -> void
+// Called from fnl_mod_init (plugin_entry.cpp) at the game stage; everything else runs from unreal-init and fue's ticks.
+auto fusernative_start(const FnlApi* api, FnlMod* self) -> void
 {
+    g_api = api;
+    g_self = self;
 #if FNL_DEBUG
     const CharType* keys = STR("; F6 test, F7 probe, F8 dump");
 #else
     const CharType* keys = STR("");
 #endif
-    Output::send<LogLevel::Verbose>(STR("[FuserNative] {} (FUSERNativeLoader): native call points, key/BPM line and setting, real song tabs, "
+    Output::send<LogLevel::Verbose>(STR("[QoL] {} (FUSERQualityOfLifeImprovements): native call points, key/BPM line and setting, real song tabs, "
                                         "song search and Key/BPM sort, song tile key/BPM, crate-edit tabs, Key Labels, new-crate slots{}\n"),
                                     FNL_WIDEN(FNL_VERSION), keys);
-    Output::send<LogLevel::Verbose>(STR("[FuserNative] genres: genre 9 (Indie/Alternative) {}\n"),
+    Output::send<LogLevel::Verbose>(STR("[QoL] genres: genre 9 (Indie/Alternative) {}\n"),
                                     fnl_genre9_requestable ? STR("is requestable - only genres >= 10 are clamped")
                                                            : STR("is NOT requestable on this build - it is clamped with genres >= 10"));
     fue::on_unreal_init(&fusernative_unreal_init);

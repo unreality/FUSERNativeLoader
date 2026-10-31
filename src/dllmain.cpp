@@ -1,4 +1,5 @@
 bool fnl_start(void* self_module); // fnl_entry.cpp: the fue core and the FuserNative features (C++20)
+void pak_diag_opened(const wchar_t* file_name, bool is_signed); // pak_diag.cpp: paks opened once the game runs
 
 #include <cstdio>
 #include <filesystem>
@@ -172,11 +173,7 @@ void load_original_dll()
 	}
 }
 
-#include <funchook.h>
-#include "hook_range.hpp"
-
-#define CHECK_FUNCHOOK_ERR(arg, message) \
-	if (arg != FUNCHOOK_ERROR_SUCCESS) printf("%s%s: %s", message, "fn", funchook_error_message(handle))
+#include "loader/code_patch.hpp"
 
 using byte = uint8_t;
 
@@ -209,6 +206,7 @@ void* FPakFile_Ctor_Hook(void *ths, void *LowerLevel, const wchar_t *FileName, b
 	void *ret = FPakFile_Ctor(ths, LowerLevel, FileName, bIsSigned, bLoadIndex);
 	printf("FPakFile - %ls (%s | %s)\n", FileName, bIsSigned ? "signed" : "not signed", bLoadIndex ? "load index" : "don't load index");
 	data.do_unsigned = false;
+	pak_diag_opened(FileName, bIsSigned);
 
 	return ret;
 }
@@ -267,80 +265,21 @@ void DoSignatureCheck_Hook(void *ths, byte bWasCanceled, void *Request, int Inde
 	DoSignatureCheck_ContinueFn(ths, bWasCanceled, Request, Index);
 }
 
-std::vector<byte> HexToBytes(const std::string& hex) {
-	std::vector<byte> bytes;
-
-	for (unsigned int i = 0; i < hex.length(); i += 2) {
-		std::string byteString = hex.substr(i, 2);
-		byte b = (byte)strtol(byteString.c_str(), NULL, 16);
-		bytes.push_back(b);
-	}
-
-	return bytes;
-}
-
+// Searches the game exe as shipped (code_patch.hpp's journal), whatever was hooked before
 byte* find_function(const char *name, const char *byteSequence) {
 	DBG_PRINT("Searching for %s.\n", name);
-	auto data = HexToBytes(byteSequence);
-
-	DBG_PRINT("	Byte Sequence: ");
-	for (int i = 0; i < data.size(); i++)
-		DBG_PRINT("%02x ", reinterpret_cast<byte*>(data.data())[i]);
-	DBG_PRINT("\n");
-
-	for (size_t i = 0; i < ModuleSize; ++i) {
-		bool done = true;
-		for (size_t j = 0; j < data.size(); ++j) {
-			if ((*(Base + i + j) != *(data.data() + j)) && byteSequence[j * 2] != '?') {
-				done = false;
-				break;
-			}
-		}
-
-		if (done) {
-			DBG_PRINT("	Found! RVA: 0x%x\n", (unsigned int)i);
-			return Base + i;
-		}
+	byte* found = code_find_pattern(byteSequence, Base, ModuleSize);
+	if (found) {
+		DBG_PRINT("	Found! RVA: 0x%x\n", (unsigned int)(found - Base));
+	} else {
+		DBG_PRINT("	No function found with that pattern!\n");
 	}
-
-	DBG_PRINT("	No function found with that pattern!\n");
-	return nullptr;
+	return found;
 }
 
-void setup_hook(void **target, void *hook) {
-	printf("Preparing to hook function...\n");
-	void *function = *target;
-	auto handle = funchook_create();
-	CHECK_FUNCHOOK_ERR(funchook_prepare(handle, target, hook), "funchook_prepare returned error: ");
-	if (!hook_in_range(function, *target)) {
-		printf("funchook's trampoline %p is out of jump range of %p - NOT hooked\n", *target, function);
-		funchook_destroy(handle);
-		*target = function;
-		return;
-	}
-	CHECK_FUNCHOOK_ERR(funchook_install(handle, 0), "funchook_install returned error:");
-	printf("Sucessfully hooked function!\n");
-}
-
-static void PatchByte(uintptr_t rva, uint8_t value) {
-	uintptr_t addr = (uintptr_t)Base + rva;
-	DWORD old;
-	VirtualProtect((LPVOID)addr, 1, PAGE_EXECUTE_READWRITE, &old);
-	*(uint8_t *)addr = value;
-	VirtualProtect((LPVOID)addr, 1, old, &old);
-	FlushInstructionCache(GetCurrentProcess(), (LPVOID)addr, 1);
-}
-
-static void PatchPatternNear(uintptr_t startRva, size_t scanSize,
-	const uint8_t *pattern, size_t patLen,
-	size_t offset, uint8_t newByte) {
-	byte *start = Base + startRva;
-	for (size_t i = 0; i <= scanSize - patLen; i++) {
-		if (memcmp(start + i, pattern, patLen) == 0) {
-			PatchByte(startRva + i + offset, newByte);
-			return;
-		}
-	}
+void setup_hook(const char *name, void **target, void *hook) {
+	const FnlHook request{ name, target, hook };
+	printf("%s %s\n", code_hook("loader", &request, 1) ? "Hooked" : "NOT hooked:", name);
 }
 
 #if FNL_DEBUG
@@ -406,11 +345,7 @@ static void PatchCallTarget(uintptr_t rva, void *newTarget) {
 	}
 
 	int32_t rel32 = (int32_t)((uintptr_t)finalTarget - callSiteVA);
-	DWORD old;
-	VirtualProtect(addr + 1, 4, PAGE_EXECUTE_READWRITE, &old);
-	memcpy(addr + 1, &rel32, 4);
-	VirtualProtect(addr + 1, 4, old, &old);
-	FlushInstructionCache(GetCurrentProcess(), addr, 5);
+	code_patch("loader", addr + 1, &rel32, 4);
 	printf("PatchCallTarget: redirected call at RVA 0x%llx to %p\n", (unsigned long long)rva, newTarget);
 }
 
@@ -446,75 +381,6 @@ void PrintString_Hook(void *WorldContextObject, FUE4String *InString, bool bPrin
 }
 #endif
 
-static void ApplyBpmPatches() {
-	// EOS
-	if (*(uint8_t*)(Base + 0x594F51) == 0x9D) {
-		PatchByte(0x594F51, 0xC8); // GetMaxBpm 157 -> 200
-		PatchByte(0x594F81, 0x3C); // GetMinBpm 90 -> 60
-
-		const uint8_t lower_cmp_cur[] = { 0x83, 0xFA, 0x5A };
-		const uint8_t lower_mov[] = { 0xB8, 0x5A, 0x00, 0x00, 0x00 };
-		const uint8_t upper_mov[] = { 0xB8, 0x9D, 0x00, 0x00, 0x00 };
-
-		PatchPatternNear(0x5A1EB0, 0x120, lower_cmp_cur, 3, 2, 0x3C);
-		PatchPatternNear(0x5A1EB0, 0x120, lower_mov, 5, 1, 0x3C);
-		PatchPatternNear(0x5A1EB0, 0x120, upper_mov, 5, 1, 0xC8);
-
-		const uint8_t lower_cmp_bpm[] = { 0x83, 0xFB, 0x5A };
-
-		PatchPatternNear(0x59ADB0, 0x120, lower_cmp_bpm, 3, 2, 0x3C);
-		PatchPatternNear(0x59ADB0, 0x120, lower_mov, 5, 1, 0x3C);
-		PatchPatternNear(0x59ADB0, 0x120, upper_mov, 5, 1, 0xC8);
-		return;
-	}
-
-	// Steam
-	if (*(uint8_t*)(Base + 0x5CC581) == 0x9D) {
-		PatchByte(0x5CC581, 0xC8); // GetMaxBpm 157 -> 200
-		PatchByte(0x5CC5B1, 0x3C); // GetMinBpm 90 -> 60
-
-		const uint8_t lower_cmp_cur[] = { 0x83, 0xFA, 0x5A };
-		const uint8_t lower_cmp_bpm[] = { 0x83, 0xFB, 0x5A };
-		const uint8_t lower_mov[] = { 0xB8, 0x5A, 0x00, 0x00, 0x00 };
-		const uint8_t upper_mov[] = { 0xB8, 0x9D, 0x00, 0x00, 0x00 };
-
-		PatchPatternNear(0x5D9454, 0x80, lower_cmp_cur, 3, 2, 0x3C);
-		PatchPatternNear(0x5D9454, 0x80, lower_mov, 5, 1, 0x3C);
-		PatchPatternNear(0x5D9454, 0x80, upper_mov, 5, 1, 0xC8);
-
-		PatchPatternNear(0x5D23E4, 0x80, lower_cmp_bpm, 3, 2, 0x3C);
-		PatchPatternNear(0x5D23E4, 0x80, lower_mov, 5, 1, 0x3C);
-		PatchPatternNear(0x5D23E4, 0x80, upper_mov, 5, 1, 0xC8);
-		return;
-	}
-}
-
-// The community's tenth genre. Custom songs use EGenre::Num (9) as "Indie/Alternative" (its display text comes from
-// a Hype.locres override, "Fuser Genres Rework"). The game reads genre 9 by name and display text like any other,
-// except the multiplayer live-requests screen: its song gather (FUN_1406440b0) builds one entry per genre for
-// i < 9 and then dereferences a missing entry, so a crate song of genre 9 crashed it (ISSUES.md, the genre section).
-// Widening that loop to i < 10 gives genre 9 its own entry - a requestable genre with its display text. Each build's
-// site is checked byte for byte before the bound is changed; values >= 10 are still clamped by FuserNative, and
-// genre 9 too when the patch did not apply (fnl_genre9_requestable, read by fusernative.cpp's clamp_song_genres).
-bool fnl_genre9_requestable = false;
-static void ApplyGenreRequestsPatch() {
-	// inc r14d; cmp r14d,9; jl <loop top>  (identical in all three builds)
-	static const uint8_t site[] = { 0x41, 0xFF, 0xC6, 0x41, 0x83, 0xFE, 0x09, 0x0F, 0x8C, 0x12, 0xFF, 0xFF, 0xFF };
-	const uintptr_t candidates[] = {
-		0x644381, // EGS v1.4.2 and EGS CL1317808
-		0x67A3E1, // Steam CL1317755
-	};
-	for (uintptr_t rva : candidates) {
-		if (rva + sizeof(site) > ModuleSize || memcmp(Base + rva, site, sizeof(site)) != 0) continue;
-		PatchByte(rva + 6, 0x0A); // cmp r14d,10
-		fnl_genre9_requestable = Base[rva + 6] == 0x0A;
-		printf("Genre patch: live-requests genre loop at RVA 0x%llx %s\n", (unsigned long long)(rva + 3),
-			fnl_genre9_requestable ? "now covers genre 9" : "could NOT be written - genre 9 stays clamped");
-		return;
-	}
-	printf("Genre patch: live-requests genre loop not found - genre 9 stays clamped\n");
-}
-
 void FUSER_HOOK() {
 	Base = (byte*)GetModuleHandleA("Fuser-Win64-Shipping.exe");
 	if (Base == 0) {
@@ -539,11 +405,11 @@ void FUSER_HOOK() {
 	DoSignatureCheck = (decltype(DoSignatureCheck)) find_function("DoSignatureCheck", "4055535657415541564157488d6c24f04881ec10010000488b05????????4833c44889450033c04963f1488d590848894c2438");
 	DoSignatureCheck_ContinueFn = (decltype(DoSignatureCheck_ContinueFn)) find_function("DoSignatureCheck_Continue", "48895c240848896c2410488974241857415641574883ec20488bf14963f94883c108498be8440fb6f2");
 
-	setup_hook((void**)&FPakFile_Ctor, FPakFile_Ctor_Hook);
-	setup_hook((void**)&GetMasterHash, GetMasterHash_Hook);
-	setup_hook((void**)&GetPakSignatureFile, GetPakSignatureFile_Hook);
-	setup_hook((void**)&HashAndGetSize, HashAndGetSize_Hook);
-	setup_hook((void**)&DoSignatureCheck, DoSignatureCheck_Hook);
+	setup_hook("FPakFile_Ctor", (void**)&FPakFile_Ctor, FPakFile_Ctor_Hook);
+	setup_hook("GetMasterHash", (void**)&GetMasterHash, GetMasterHash_Hook);
+	setup_hook("GetPakSignatureFile", (void**)&GetPakSignatureFile, GetPakSignatureFile_Hook);
+	setup_hook("HashAndGetSize", (void**)&HashAndGetSize, HashAndGetSize_Hook);
+	setup_hook("DoSignatureCheck", (void**)&DoSignatureCheck, DoSignatureCheck_Hook);
 
 	// PrintString's real implementation is a stripped no-op in this Shipping build (raw bytes `ret 0`,
 	// confirmed statically and live). The call-site RVAs below are the EGS exes' (v1.4.2, CL1317808); a site
@@ -617,8 +483,6 @@ BOOL WINAPI DllMain(HMODULE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 #endif
 		DisableLegacyUnlockPak(hinstDLL);
 		FUSER_HOOK();
-		ApplyBpmPatches();
-		ApplyGenreRequestsPatch();
 		// the UE 4.24 reflection core (fue), the runtime unlocks and the FuserNative features
 		fnl_start(hinstDLL);
 	}

@@ -39,16 +39,16 @@ namespace content
     // Reads a pak's index and manifests from its file (no engine needed): the items it holds, checked as the
     // registration checks them - one CustomContent/<id>/ folder per item, nothing outside those folders, a known
     // type and the files its manifest names. Empty, with why set, when the pak can't be used.
-    auto read_items(const std::filesystem::path& pak, StringType* why) -> std::vector<ItemInfo>;
+    FNL_API auto read_items(const std::filesystem::path& pak, StringType* why) -> std::vector<ItemInfo>;
 
     // The multiplayer extension's server paks for the startup registration: called once, at unreal-init, with the
     // ids custom_content/ registered (lower case). It mounts the server paks it keeps whose ids none of those
     // override, and returns them; they are registered after custom_content/.
     using ServerPaks = std::function<std::vector<std::filesystem::path>(const std::vector<StringType>& custom_ids)>;
-    auto set_server_paks(ServerPaks provider) -> void;
+    FNL_API auto set_server_paks(ServerPaks provider) -> void;
 
     // The ids registered from custom_content/ (lower case). Valid after unreal-init.
-    auto custom_ids() -> std::vector<StringType>;
+    FNL_API auto custom_ids() -> std::vector<StringType>;
 
     // A registered item, or nothing.
     struct Registered
@@ -57,7 +57,7 @@ namespace content
         Source source;
         bool live; // inserted into the live managers (false: its rows wait for the next launch)
     };
-    auto registered(const StringType& id) -> std::optional<Registered>;
+    FNL_API auto registered(const StringType& id) -> std::optional<Registered>;
 
     // Registers a mounted server pak's items while the game runs (game thread): each item's rows, then the live
     // managers. One line per item: what happened.
@@ -67,9 +67,9 @@ namespace content
         bool ok = false;   // usable now
         StringType note;   // what was done, or why not
     };
-    auto register_live(const std::filesystem::path& pak) -> std::vector<LiveResult>;
+    FNL_API auto register_live(const std::filesystem::path& pak) -> std::vector<LiveResult>;
 
     // EUnlockableType: its index (-1 for an unknown name) and its name.
-    auto unlock_type_index(const StringType& name) -> int;
-    auto unlock_type_name(int index) -> StringType;
+    FNL_API auto unlock_type_index(const StringType& name) -> int;
+    FNL_API auto unlock_type_name(int index) -> StringType;
 } // namespace content

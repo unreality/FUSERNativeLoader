@@ -1,16 +1,19 @@
 # FUSERNativeLoader
 
 The FUSER mod loader (a `winhttp.dll` proxy, based on the community FuserSongLoader) with a minimal UE 4.24
-reflection core (**fue**) and the **FuserNative** features built in: key/BPM on the HUD song items and the crate
-editor's song tiles, Key Labels, real song tabs, song search with `key:` / `bpm:` / `genre:` filter words, Key and BPM sorting,
-crate-edit tabs, new-crate slot sizes, the mod settings rows, and free unlocks for custom and event songs. Three build
-outputs:
+reflection core (**fue**), and the mods it loads. The loader itself holds no game features: it bypasses the signature
+check for `*_P` paks, loads the mods in `mods/` (see Mods), gives them the Settings screen's **Mods** tab, and keeps
+the free unlocks for custom and event songs and custom content. The features are bundled mods:
 
 | Output | What |
 |---|---|
-| `winhttp.dll` | the loader: pak-signature bypass for `*_P` paks, BPM range patch, fue, unlocks, FuserNative |
-| `FUSERMultiplayer.dll` | optional multiplayer client extension (see Multiplayer), loaded by `winhttp.dll` when present beside it |
-| `FUSERNativeMods_P.pak` (+ `.sig`) | FuserNative's cooked Blueprint assets (`/Game/Mods/FuserNative/`) |
+| `winhttp.dll` | the loader |
+| `mods/FUSERQualityOfLifeImprovements/` | **FuserNative**: key/BPM on the HUD song items and the crate editor's song tiles, Key Labels, real song tabs, song search with `key:` / `bpm:` / `genre:` filter words, Key and BPM sorting, crate-edit tabs, new-crate slot sizes, genre 9 in live requests; its pak holds the cooked Blueprint assets (`/Game/Mods/FuserNative/`) |
+| `mods/FUSERFifthDeck/` | the fifth deck and Hot Clip Volume Normalisation; its pak holds the five-deck desk |
+| `mods/FUSERMultiplayer/` | the multiplayer client (`src/multiplayer/README.md`) |
+| `mods/FUSERBpmRange/` | the BPM range widened from 90-157 to 60-200 |
+| `mods/FUSERFixes/` | engine and SDK fixes (the EOS_Shutdown exit guard) |
+| `Paks/mods/<Name>_P.pak` (+ `.sig`) | the mods' cooked assets, installed to `Fuser/Content/Paks/mods/` |
 
 ## AI Usage Disclosure
 
@@ -25,19 +28,19 @@ are for building/development on the mod.
 
 - Windows, **Visual Studio 2022** (MSVC x64, C++20) and **CMake 3.20+** (e.g. from a Developer PowerShell).
 - **Python 3** for the pak tool (standard library only).
-- Optional, for `tools/derive_build.py` and `tools/derive_mp_build.py`: `pefile`, `capstone`, `numpy`.
+- Optional, for `tools/derive_build.py`, `tools/derive_mp_build.py` and `tools/derive_fifth_deck_build.py`: `pefile`, `capstone`, `numpy`.
 
 ## Build
 
 ```powershell
-.\build.ps1                          # out\Release\: both DLLs (+ PDBs), FUSERNativeMods_P.pak / .sig
-.\build.ps1 -Configuration Debug     # out\Debug\: diagnostic winhttp.dll, multiplayer DLL, same pak
+.\build.ps1                          # out\Release\: winhttp.dll, mods\<Name>\, Paks\mods\ (+ PDBs)
+.\build.ps1 -Configuration Debug     # out\Debug\: the diagnostic DLLs, same paks
 .\build.ps1 -Package                 # also out\FUSERNativeLoader-<version>.zip (+ -symbols.zip)
 ```
 
 The **Debug** configuration is the diagnostic build (`FNL_DEBUG`): a console with the loader's tracing, the F6-F10
-debug keys (F6 key/BPM self-test, F7 song probe, F8 crate-edit and settings dumps, F9 fue probe, F10 unlock state)
-and the probes. Both configurations are optimised. The version comes from `VERSION`.
+debug keys (F6 key/BPM self-test, F7 song probe, F8 crate-edit and settings dumps, F9 fue probe, F10 unlock state,
+Ctrl+Shift+5 fifth-deck layout and state) and the probes. Both configurations are optimised. The version comes from `VERSION`.
 
 ## Install for testing
 
@@ -49,28 +52,46 @@ $env:FUSER_GAME_ROOT = '<folder containing Fuser\>'
 
 Settings: `Fuser\Binaries\Win64\FuserNative.ini`; log: `Fuser\Binaries\Win64\FuserNative.log`.
 `ExtraSortOptions=0` in the ini removes Key and BPM from the crate editor's Sort dropdown (no Settings row).
-Remove or rename `FUSERMultiplayer.dll` to run the base FUSERNative features without multiplayer hooks.
+Set `enabled=0` in `Fuser\Binaries\Win64\mods\FUSERMultiplayer\mod.ini` (or rename the folder to end in `.disabled`) to
+run the other mods without multiplayer hooks; every bundled mod turns off the same way.
 Custom content paks (`tools/fuser_content_pak.py`) go in `Fuser\Content\Paks\custom_content\`, next to `custom_songs\`.
-Server content (fuserd's items, kept by the multiplayer DLL) lives in `Fuser\Content\ServerContent\`; `ServerContentWaitSeconds`
-(default 30, 0 = never) caps how long the title screen waits for the login sync before the main menu.
-The multiplayer DLL requires `winhttp.dll` and is not a standalone proxy.
+Server content (fuserd's items, kept by the multiplayer DLL) lives in `Fuser\Content\ServerContent\` (see
+`src/multiplayer/README.md`).
+
+## Mods
+
+`winhttp.dll` loads the mods in `Fuser\Binaries\Win64\mods\<Name>\`, each described by a `mod.ini` (keys in
+`src/loader/mod_manager.cpp`) and built against `sdk/fnl_mod.h`. A mod's `fnl_mod_init` runs at its stage: `early`
+(inside the loader's DllMain, before any pak is mounted) or `game` (the first engine callback, before the unreal-init
+callbacks). It gets the loader's logging, pattern search, hooks, code patches, import redirects, engine events and
+`FuserNative.ini` values; code it changes through them is recorded, so every pattern search still sees the game as
+shipped. A mod built on fue (the C++ tier, `sdk=` in its `mod.ini`) must match the loader's `FNL_SDK_VERSION`.
+`FuserNative.log` lists each mod as it loads, or why it didn't; Settings > About FUSER lists every installed mod.
+Writing a mod: `sdk/README.md` (the SDK: headers, `lib\winhttp.lib` from `out\<cfg>\lib\`, a template mod; also packed
+as `out\FUSERNativeLoader-<version>-sdk.zip` by `build.ps1 -Package`). The design: `MOD_LOADER.MD`. Checks:
+`tests/mod_loader/`.
 
 ## Layout
 
 | Path | |
 |---|---|
-| `src/dllmain.cpp` | the loader (proxy exports, pak-signature bypass, BPM patches, legacy unlock-pak rename) |
-| `src/fnl_entry.cpp` | `fnl_start`: fue, unlocks, custom content, FuserNative; the debug fue probe |
-| `src/fue/` | the reflection core: objects, properties, ProcessEvent / tick / native hooks, per-build addresses |
+| `src/dllmain.cpp` | the loader (proxy exports, pak-signature bypass, legacy unlock-pak rename) |
+| `src/fnl_entry.cpp` | `fnl_start`: fue, the mods' early stage, the Mods tab, unlocks, custom content; the debug fue probe |
+| `src/loader/` | the mod loader: `mod_manager.cpp` (manifests, load order, stages, the `FnlApi` table), `code_patch.cpp` (pattern search, hooks, patches and import redirects, with the patch journal) and `settings.cpp` (the settings registry and the Settings screen's Mods tab) |
+| `sdk/` | the SDK: `fnl_mod.h` (the C tier), the C++ tier's headers (`fue/fue.hpp`, `data_table.hpp`, `custom_content.hpp`, `content/content_types.hpp`, `unlocks.hpp`, `json_lite.hpp`; `FNL_API` marks what `winhttp.dll` exports), `README.md` (writing a mod) and `template/` |
+| `src/fue/` | the reflection core (`fue.cpp`; its header is `sdk/fue/fue.hpp`): objects, properties, ProcessEvent / tick / native hooks, per-build addresses |
 | `src/unlocks.cpp` | custom and event song unlocks, patched into the live `DT_UnlocksSongs` at startup |
 | `src/custom_content.cpp` | custom and server content (`custom_content.hpp`): the content pak reader, the item registry, the startup registration (`custom_content/` free, server content locked) and the live one |
 | `src/content/` | the content types (`content_types.cpp`: one handler per type; `content_projector.cpp`: projector screens) and the unlock rows every type shares (`content_unlocks.cpp`) |
 | `src/data_table.cpp` | `UDataTable` loading, row walking and `AddRow`, shared by the table patches; inserting into the managers' `TMap<FName, …>`s after boot |
-| `src/native/fusernative.cpp` | the FuserNative features |
+| `src/qol/` | the Quality of Life Improvements mod (`mod.ini`, `plugin_entry.cpp`: its entry and the genre 9 requests patch): `fusernative.cpp`, the FuserNative features |
+| `src/bpm_range/` | the BPM Range mod (early stage, C tier) |
+| `src/fixes/` | the Fixes mod (C tier): the EOS_Shutdown exit guard |
 | `src/debug/unlock_probe.cpp` | debug builds: unlock-state probe (F10) |
-| `src/multiplayer/` | optional multiplayer DLL: matchmaking join, P2P tunnel, custom song sync, Diamond store, server content (`server_content.cpp`) |
+| `src/fifth_deck/` | the Fifth Deck mod (`mod.ini`, `plugin_entry.cpp`, `fifth_deck.cpp`): the fifth deck (Settings > Mods > Fifth Deck, `FifthDeck=` in FuserNative.ini; the three builds below): a deck on track `Deck0A` (17, unused outside Battle) with its controls (`BP_DeckUi`), at the right end of a widened desk (`SM_WorkspaceDesk_5Deck` in its pak, the stock desk with its arc lengthened, swapped onto the desk; without it, no fifth deck). While it is up, track 17's silent `UDummyAudioTrack` is swapped for a real `UAudioTrack` playing the stem event `event:/song/stems/lead` (a deck's level and compressor), and each of its stems is moved off the Lead bus onto its own FMOD channel group under `bus:/Music/MusicSub` (master effects, no other deck's effects). Hot Clips keep their own track. A smart riser also plays its stem's riser (the stem's `SongTransitionCelData`, as each stock deck's riser plays on its `TransitionSong` track): track 18 (`Deck1A`) gets a second real `UAudioTrack` for it, playing Deck3's riser event once (the riser tracks play their cel once, other tracks loop it) at the riser tracks' level, muted with the fifth deck. In a freestyle set it goes up with the toggle on, once the desk view is ready; turned off on stage, its stems are ejected and the desk restored. Solo, mute, the queue switch, smart risers and the multiplayer fades and deck resets (round start, lobby) include it. In a multiplayer set it goes up on every client running this, hidden with the toggle off (no controls, desk unchanged), so another player's fifth deck plays, queues and lands on the beat here; clients without it hear nothing from it. A performer switch leaves it playing, like the other decks; while a player controls the decks with Fifth Deck off (or turns it off during their turn), their client keeps it clear in the background: stems ejected, solo / mute released. Recordings, saved moments and the hottest mix leave it out. Also Settings > Mods > Hot Clip Volume Normalisation (`HotClipVolume=`, off by default, independent of the deck): keeps Hot Clips on their louder quickclip event after a song audition. Debug builds: Ctrl+Shift+5 lays the desk out again and logs the deck's state |
+| `src/multiplayer/` | the multiplayer mod (`mod.ini`, `plugin_entry.cpp`, `README.md`): matchmaking join, custom song sync and transfers, Diamond store, crate song limit, shared mixes, server content (`server_content.cpp`) |
 | `lib/` | funchook (prebuilt `funchook.lib` + header); `lib/libarchive/`: static libarchive 3.8.9 + zlib 1.3.2 for the multiplayer DLL's community song archives, rebuilt by `tools/build_libarchive.ps1` |
-| `assets/Content/` | the cooked assets packed into `FUSERNativeMods_P.pak` |
+| `assets/<Mod>/Content/` | each mod's cooked assets, packed into `<Mod>_P.pak` (`FUSERQualityOfLifeImprovements`: `BPL_FuserNative`, `WBP_FuserKeyBpm`; `FUSERFifthDeck`: `SM_WorkspaceDesk_5Deck`, from `tools/desk_5deck_fbx.py`, imported with `tools/modkit_import_mesh.py`) |
 | `modkit/FuserModkit/` | the UE 4.24 editor project those assets are authored and cooked in |
 | `docs/MOD_DEVELOPMENT.md` | a step-by-step tutorial for adding a new feature (assets, native code, settings, pak) |
 | `CUSTOM_CONTENT.MD` | custom content (projector screens): pak format, loading requirements, test results, content tiers |
@@ -79,49 +100,8 @@ The multiplayer DLL requires `winhttp.dll` and is not a standalone proxy.
 | `tools/fuser_content_pak.py` | packs a custom content item (a projector screen video) into `<id>_P.pak` + `.sig` for `custom_content/` |
 | `tools/derive_build.py` | derives fue's addresses for another FUSER executable (e.g. Steam) by static analysis |
 | `tools/derive_mp_build.py` | derives `FUSERMultiplayer.dll`'s ~30 game addresses for another executable (`host_hook.cpp`, `kVerified`) |
-
-## Multiplayer
-
-`FUSERMultiplayer.dll` is the client side of multiplayer against a fuserd server; sessions are hosted by the FDS
-dedicated server. It handles:
-
-- the matchmaking join, with `JoinAddressOverride=` and the P2P tunnel (`P2P=1`) for joiners;
-- custom songs: catalogue and community installs, song transfers between players (Download Songs / Send Songs to
-  Other Players, Upload Speed Limit (`SendSongsKBps`, 256 KB/s-4 MB/s, default 2 MB/s) and Simultaneous Uploads
-  (`SendSongsMax`, 1-4, default 2) in the game's settings; the upload rows are greyed out while Send Songs is off,
-  and a change applies to the next transfer, not to ones under way), the sync notices on the event highway, and in
-  the lobby a "Custom Songs Sync" panel with every player's progress, from fuserd's sync states (`SyncProgressBar=0`
-  turns it off). Only performers' crate
-  songs are fetched: a viewer's crate is never played;
-- the server's crate song limit (fuserd `multiplayer.max_crate_songs`, read from `multiplayer/limits/`): entering
-  multiplayer or the Main Stage with more songs fails the game's own crate check, with a "Crate Error" popup naming
-  the limit. The same call, logged in, reports the loader's version and exe build to fuserd (at login and on each
-  entry to multiplayer), which keeps stock FUSER players apart from loader users;
-- the Diamond store's installs and tiles;
-- a shared mix's custom songs: when a mix's playback starts, its song list comes from fuserd
-  (`community/recording_songs/`), the songs this machine lacks are fetched like crate songs, and the playback waits
-  for them (at most 2 minutes) behind a "Custom Songs" status popup, with a popup naming any that couldn't be fetched.
-  Mixes the game only previews (the playback-complete screen's next mixes, the mix browser) aren't checked.
-  Download Mix Songs in the game's settings (`DownloadMixSongs`, No / Temporarily / Permanently, default
-  Temporarily) places them;
-- the missing-stem skip (`MissingCelSkip`), so a song this machine lacks doesn't stall a DJ's queue;
-- diagnostics: `DiagnosticLogs=1` (off by default, in every build) logs the clock samples during a set
-  (`HostLobbyClockTrace=1` adds lobby samples) and the state / connection watch after a join. The Debug build
-  (`FNL_DEBUG`) adds trace hooks, which a release build never installs: the drop chain and deck trace (`DeckTrace`),
-  the leave trace (`LeaveTrace=1`), and the keys below.
-
-**Player-hosted sessions** (fuserd makes the creating player the host when it runs no FDS servers) are a stub:
-the loader logs that a local FDS server is needed and lets the stock join run. The earlier hosts - the player's
-own game as a listen server, and a second headless game process (the sidecar) - were removed.
-So were the client-side fixes every joiner ran in that era (`FDS_WORKAROUND`, `ClientWorkarounds=1`), removed on
-2026-10-08 once FDS was confirmed to behave correctly without them.
-
-Keys (Debug build only; game window focused): `Ctrl+Shift+J` direct join to `HostAddress` + `JoinOptions` (an FDS needs
-`?playerSessionId=?gameSessionId=?hypeUserId=?buildConfig=`; the join also loads the lobby music and sets the
-multiplayer game mode, which a plain `open` skips), `Ctrl+Shift+T` an 8 s ProcessEvent trace, `Ctrl+Shift+R` report, `Ctrl+Shift+U` install `StoreTestInstall`,
-`Ctrl+Shift+N` STUN probe (`P2PProbe=1` runs it once after login), `Ctrl+Shift+X` song transfer test. Loader
-messages go to `FuserNative.log`
-(`FuserNative.2.log` for a second instance from the same install).
+| `tools/derive_fifth_deck_build.py` | derives the fifth deck's ~25 game addresses for another executable (`fifth_deck/fifth_deck.cpp`, `kBuildAddrs`) |
+| `tools/desk_5deck_fbx.py` | Blender script: builds a five-deck desk FBX from the cooked stock `SM_WorkspaceDesk_Simple.uexp` (arc lengthened, ends kept), for `tools/modkit_import_mesh.py` |
 
 ## Supported executables
 
@@ -153,10 +133,18 @@ hard-codes may have changed, so review it before adding the row. `check` entries
 unreflected offsets that none of the called functions use. `RETIRED` entries are the removed listen-host code's
 functions: still derived, but left out of the row. `--self-test` must reproduce the EGS v1.4.2 row.
 
+The fifth deck (`src/fifth_deck/fifth_deck.cpp`) has a third table, `kBuildAddrs` (about 25 RVAs), with rows for all three
+builds. On a build without a row there is no fifth deck and no Fifth Deck setting. To add a build, run
+`python tools/derive_fifth_deck_build.py --target <exe> --name "<fue build name>" --ref <EGS v1.4.2 exe>` (an unpacked
+copy for Steam) and paste the printed row once every address is CONFIRMED with its body the same; its `check`
+entries cover the unreflected offsets the module hard-codes. `--self-test` must reproduce the EGS v1.4.2 row.
+
 ## The cooked assets
 
-`assets/Content/Mods/FuserNative/` holds the cooked `BPL_FuserNative` (the key/BPM call points, bound to native code
-at runtime) and `WBP_FuserKeyBpm` (the key/BPM line widget). They are authored in `modkit/FuserModkit/` (a
+`assets/FUSERQualityOfLifeImprovements/Content/Mods/FuserNative/` holds the cooked `BPL_FuserNative` (the key/BPM
+call points, bound to native code at runtime) and `WBP_FuserKeyBpm` (the key/BPM line widget);
+`assets/FUSERFifthDeck/Content/Mods/FuserNative/` holds `SM_WorkspaceDesk_5Deck`. Each mod's folder becomes its own
+`<Mod>_P.pak`; the asset paths stay under `/Game/Mods/FuserNative/`. They are authored in `modkit/FuserModkit/` (a
 Blueprint-only UE 4.24 project; File > Cook Content for Windows) and copied here from its
 `Saved/Cooked/WindowsNoEditor/FuserModkit/Content/`. `docs/MOD_DEVELOPMENT.md` walks through the whole cycle.
 

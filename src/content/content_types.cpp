@@ -1,6 +1,6 @@
-// The content types the loader registers. Every unlockable type can have one: its handler adds the item's game rows
-// (the unlock row is common to all, content_unlocks.cpp) and, when it can, inserts the item into the managers after
-// boot. A type with a content.json but no handler here is refused with its name in the log.
+// The content types: the loader's own and the ones mods register. Every unlockable type can have one: its handler
+// adds the item's game rows (the unlock row is common to all, content_unlocks.cpp) and, when it can, inserts the item
+// into the managers after boot. A type with a content.json but no handler is refused with its name in the log.
 #include "content/content_types.hpp"
 
 #include <algorithm>
@@ -13,13 +13,37 @@ namespace content
     auto projector_handler() -> TypeHandler;   // content_projector.cpp
     auto outfit_part_handler() -> TypeHandler; // content_outfit.cpp
 
-    auto type_handlers() -> const std::vector<TypeHandler>&
+    namespace
     {
-        static const std::vector<TypeHandler> handlers = {
-            projector_handler(),
-            outfit_part_handler(),
-        };
-        return handlers;
+        auto handlers() -> std::vector<TypeHandler>&
+        {
+            static std::vector<TypeHandler> list = {
+                projector_handler(),
+                outfit_part_handler(),
+            };
+            return list;
+        }
+    } // namespace
+
+    auto type_handlers() -> const std::vector<TypeHandler>& { return handlers(); }
+
+    auto register_type(const TypeHandler& handler) -> bool
+    {
+        const StringType type = to_wstring(handler.type ? handler.type : "");
+        if (type.empty() || !handler.validate || !handler.add_rows || handler.unlock_type >= UnlockType::Count)
+        {
+            Output::send<LogLevel::Error>(STR("[content] content type '{}': a name, validate, add_rows and an unlock type are needed - not registered\n"), type);
+            return false;
+        }
+        if (find_handler(handler.type))
+        {
+            Output::send<LogLevel::Error>(STR("[content] content type '{}' exists already - not registered\n"), type);
+            return false;
+        }
+        handlers().push_back(handler);
+        Output::send<LogLevel::Normal>(STR("[content] content type '{}' registered ({} unlocks{})\n"), type, unlock_type_name(static_cast<int>(handler.unlock_type)),
+                                       handler.register_live ? STR(", live") : STR(", from the next launch when added later"));
+        return true;
     }
 
     auto find_handler(const std::string& type) -> const TypeHandler*

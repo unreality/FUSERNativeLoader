@@ -3,65 +3,16 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
-#include <filesystem>
 
 #include "fue/fue.hpp"
-#include "hook_range.hpp"
-#include <funchook.h>
+#include "loader/mod_manager.hpp"
+#include "loader/settings.hpp"
+#include "pak_diag.hpp"
 
 using namespace fue;
 
 namespace
 {
-    // The EGS 1.4.2 EOS SDK can throw a C++ exception from EOS_Shutdown during
-    // normal game exit (the same stack in several crash dumps). Keep
-    // the SDK's normal cleanup path, but do not let an exit-only failure invoke
-    // UE's crash reporter and disrupt the still-running player process.
-    using EosShutdownFn = int32_t (*)();
-    EosShutdownFn g_eos_shutdown = nullptr;
-    funchook_t* g_eos_shutdown_hook = nullptr;
-    bool g_eos_shutdown_installed = false;
-    bool g_eos_shutdown_attempted = false;
-
-    auto eos_shutdown_detour() -> int32_t
-    {
-        try
-        {
-            return g_eos_shutdown();
-        }
-        catch (...)
-        {
-            Output::send<LogLevel::Warning>(STR("[fnl] EOS_Shutdown threw during process exit; continuing shutdown\n"));
-            return 0; // EOS_Success: the process is already exiting.
-        }
-    }
-
-    auto install_eos_shutdown_guard() -> void
-    {
-        if (g_eos_shutdown_attempted) return;
-        HMODULE sdk = GetModuleHandleW(L"EOSSDK-Win64-Shipping.dll");
-        if (!sdk) return;
-        auto* entry = GetProcAddress(sdk, "EOS_Shutdown");
-        g_eos_shutdown_attempted = true;
-        if (!entry) return;
-        g_eos_shutdown = reinterpret_cast<EosShutdownFn>(entry);
-        g_eos_shutdown_hook = funchook_create();
-        if (!g_eos_shutdown_hook) return;
-        const int prep = funchook_prepare(g_eos_shutdown_hook, reinterpret_cast<void**>(&g_eos_shutdown),
-                                          reinterpret_cast<void*>(&eos_shutdown_detour));
-        if (prep == 0 && !hook_in_range(reinterpret_cast<const void*>(entry), reinterpret_cast<const void*>(g_eos_shutdown)))
-        {
-            Output::send<LogLevel::Error>(STR("[fnl] EOS_Shutdown exit guard: funchook's trampoline is out of jump range - not installed\n"));
-            funchook_destroy(g_eos_shutdown_hook);
-            g_eos_shutdown_hook = nullptr;
-            g_eos_shutdown = reinterpret_cast<EosShutdownFn>(entry);
-            return;
-        }
-        const int inst = prep == 0 ? funchook_install(g_eos_shutdown_hook, 0) : -1;
-        g_eos_shutdown_installed = prep == 0 && inst == 0;
-        Output::send<LogLevel::Normal>(STR("[fnl] EOS_Shutdown exit guard: prepare {} install {}\n"), prep, inst);
-    }
-
     // A ProcessEvent call with a parameter buffer built through the parameters' properties (FuserNative's PCall).
     struct Call
     {
@@ -170,54 +121,22 @@ namespace
     }
 } // namespace
 
-auto fusernative_start() -> void; // native/fusernative.cpp
 auto unlocks_start() -> void;     // unlocks.cpp
 auto custom_content_start() -> void; // custom_content.cpp
 auto unlock_probe_start() -> void; // unlock_probe.cpp (debug builds)
 
-namespace
-{
-    auto start_optional_multiplayer() -> void
-    {
-        const std::wstring path = std::filesystem::path(fue::module_dir()).append(L"FUSERMultiplayer.dll").wstring();
-        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return;
-        HMODULE plugin = LoadLibraryW(path.c_str());
-        if (!plugin)
-        {
-            Output::send<LogLevel::Error>(STR("[fnl] multiplayer: DLL load failed (Win32 {})\n"), GetLastError());
-            return;
-        }
-        using Start = bool (*)(unsigned int);
-        auto start = reinterpret_cast<Start>(GetProcAddress(plugin, "fnl_multiplayer_start"));
-        if (!start || !start(1))
-            Output::send<LogLevel::Error>(STR("[fnl] multiplayer: incompatible extension\n"));
-        else
-            Output::send<LogLevel::Normal>(STR("[fnl] multiplayer: extension loaded\n"));
-    }
-}
-
-// Called by fue at the first engine callback, outside the Windows loader lock and before
-// Unreal-init callbacks run. Loading another DLL from our DllMain startup would be unsafe.
-auto fnl_load_optional_multiplayer() -> void
-{
-    static bool attempted = false;
-    if (attempted) return;
-    attempted = true;
-    start_optional_multiplayer();
-}
-
-// The loader's entry (dllmain.cpp, after FUSER_HOOK): the fue core, the unlocks, custom content, then FuserNative.
-// The multiplayer extension is loaded on the first engine callback; the probe (F9) is debug-only.
+// The loader's entry (dllmain.cpp, after FUSER_HOOK): the fue core, the mods' manifests and early stage, the Mods tab,
+// the unlocks and custom content. The game features are mods, loaded at the first engine callback (fue); the probe
+// (F9) is debug-only.
 bool fnl_start(void* self_module)
 {
-    if (!fue::init(self_module)) return false;
-    install_eos_shutdown_guard();
-    Hook::RegisterEngineTickPreCallback([](Hook::TCallbackIterationData<void>&, UEngine*, float, bool) {
-        if (!g_eos_shutdown_installed) install_eos_shutdown_guard();
-    });
+    const bool fue_ok = fue::init(self_module);
+    fnl_mods_early(fue_ok); // before any pak is mounted, whether or not fue is up: early mods are C tier
+    if (!fue_ok) return false;
+    pak_diag_start();
+    settings_start(); // the Settings screen's Mods tab, for the mods' rows
     unlocks_start(); // first: its unreal-init step must precede UnlockMgr's init
     custom_content_start(); // its rows, too, must precede UnlockMgr's and UVenueMgr's table reads
-    fusernative_start();
 #if FNL_DEBUG
     unlock_probe_start();
 #endif

@@ -1,5 +1,6 @@
 #pragma once
-// fue - a minimal UE 4.24 reflection core for FUSER, built into winhttp.dll (FUSERNativeLoader).
+// fue - a minimal UE 4.24 reflection core for FUSER, built into winhttp.dll (FUSERNativeLoader) and exported to C++
+// tier mods (FNL_API).
 //
 // It provides the subset of UE4SS's API that FuserNative uses, with the same type and member names (FuserNative
 // began as a UE4SS C++ mod). Every engine type here is a *view*: no data
@@ -16,6 +17,16 @@
 
 #define STR(x) L##x
 
+// FNL_API: what winhttp.dll exports to C++ tier mods, and what they import. FNL_LOADER is defined where these are
+// compiled in (the loader, and the offline tests).
+#ifndef FNL_API
+#ifdef FNL_LOADER
+#define FNL_API __declspec(dllexport)
+#else
+#define FNL_API __declspec(dllimport)
+#endif
+#endif
+
 namespace fue
 {
     using CharType = wchar_t;
@@ -30,14 +41,14 @@ namespace fue
     using int64 = int64_t;
     using uint64 = uint64_t;
 
-    auto to_wstring(const char* s) -> StringType;
+    FNL_API auto to_wstring(const char* s) -> StringType;
     inline auto to_wstring(const std::string& s) -> StringType { return to_wstring(s.c_str()); }
 
     // ------------------------------------------------------------------ logging -----------------
     enum class LogLevel { Verbose, Normal, Warning, Error };
     namespace Output
     {
-        auto write(LogLevel level, const StringType& text) -> void;
+        FNL_API auto write(LogLevel level, const StringType& text) -> void;
         template <LogLevel L, typename... Args>
         auto send(std::wformat_string<Args...> f, Args&&... args) -> void
         {
@@ -53,17 +64,18 @@ namespace fue
     // init() (DllMain): verify the exe, resolve addresses, install the ProcessEvent / GameEngine::Tick detours.
     // The first GameEngine::Tick runs the registered "unreal init" callbacks (UE4SS's on_unreal_init).
     auto init(void* self_module) -> bool;
-    auto ready() -> bool;
-    auto build_name() -> const CharType*; // the matched kBuilds entry, e.g. "EGS v1.4.2"
-    auto on_unreal_init(std::function<void()> callback) -> void;
-    auto module_dir() -> std::wstring; // the folder holding winhttp.dll
+    FNL_API auto ready() -> bool;
+    FNL_API auto build_name() -> const CharType*; // the matched kBuilds entry, e.g. "EGS v1.4.2"
+    FNL_API auto build_known() -> bool;           // a kBuilds entry matched the exe (init can still fail its other checks)
+    FNL_API auto on_unreal_init(std::function<void()> callback) -> void;
+    FNL_API auto module_dir() -> std::wstring; // the folder holding winhttp.dll
 
     // ------------------------------------------------------------------ memory (GMalloc) --------
     namespace FMemory
     {
-        auto Malloc(size_t count, uint32 alignment = 0) -> void*;
-        auto Realloc(void* original, size_t count, uint32 alignment = 0) -> void*;
-        auto Free(void* original) -> void;
+        FNL_API auto Malloc(size_t count, uint32 alignment = 0) -> void*;
+        FNL_API auto Realloc(void* original, size_t count, uint32 alignment = 0) -> void*;
+        FNL_API auto Free(void* original) -> void;
     } // namespace FMemory
 
     // ------------------------------------------------------------------ containers --------------
@@ -103,10 +115,10 @@ namespace fue
     {
         TArray<TCHAR> Chars{};
         FString() = default;
-        explicit FString(const TCHAR* s);
+        FNL_API explicit FString(const TCHAR* s);
         FString(const FString&) = delete;
         FString& operator=(const FString&) = delete;
-        ~FString();
+        FNL_API ~FString();
         auto operator*() const -> const TCHAR* { return Chars.Data && Chars.ArrayNum ? Chars.Data : L""; }
     };
     static_assert(sizeof(FString) == 0x10);
@@ -118,8 +130,8 @@ namespace fue
         uint32 ComparisonIndex = 0;
         uint32 Number = 0;
         FName() = default;
-        FName(const CharType* name, EFindName find = FNAME_Add);
-        auto ToString() const -> StringType;
+        FNL_API FName(const CharType* name, EFindName find = FNAME_Add);
+        FNL_API auto ToString() const -> StringType;
         auto operator==(const FName& o) const -> bool { return ComparisonIndex == o.ComparisonIndex && Number == o.Number; }
         auto operator!=(const FName& o) const -> bool { return !(*this == o); }
         auto Equals(const FName& o) const -> bool { return *this == o; }
@@ -163,20 +175,20 @@ namespace fue
         auto GetFName() const -> FName { return detail::at<FName>(this, 0x18); }
         auto GetInternalIndex() const -> int32 { return detail::at<int32>(this, 0xC); }
         auto GetName() const -> StringType { return GetFName().ToString(); }
-        auto GetPathName() const -> StringType;
-        auto GetFullName() const -> StringType;
-        auto IsA(const UClass* cls) const -> bool;
-        auto IsRootSet() const -> bool;
-        auto SetRootSet() -> void;
-        auto ProcessEvent(UFunction* fn, void* parms) -> void;
-        auto GetPropertyByNameInChain(const CharType* name) const -> class FProperty*;
-        auto GetValuePtrByPropertyNameInChain(const CharType* name) -> void*;
+        FNL_API auto GetPathName() const -> StringType;
+        FNL_API auto GetFullName() const -> StringType;
+        FNL_API auto IsA(const UClass* cls) const -> bool;
+        FNL_API auto IsRootSet() const -> bool;
+        FNL_API auto SetRootSet() -> void;
+        FNL_API auto ProcessEvent(UFunction* fn, void* parms) -> void;
+        FNL_API auto GetPropertyByNameInChain(const CharType* name) const -> class FProperty*;
+        FNL_API auto GetValuePtrByPropertyNameInChain(const CharType* name) -> void*;
         template <typename T>
         auto GetValuePtrByPropertyNameInChain(const CharType* name) -> T*
         {
             return static_cast<T*>(GetValuePtrByPropertyNameInChain(name));
         }
-        auto GetFunctionByNameInChain(FName name) const -> UFunction*;
+        FNL_API auto GetFunctionByNameInChain(FName name) const -> UFunction*;
         auto GetFunctionByNameInChain(const CharType* name) const -> UFunction* { return GetFunctionByNameInChain(FName(name, FNAME_Add)); }
     };
 
@@ -192,7 +204,7 @@ namespace fue
         auto GetSuperStruct() const -> UStruct* { return detail::at<UStruct*>(this, 0x40); }
         auto GetChildren() const -> UField* { return detail::at<UField*>(this, 0x48); }
         auto GetPropertiesSize() const -> int32 { return detail::at<int32>(this, 0x50); }
-        auto FindProperty(FName name) const -> class FProperty*; // uncached walk incl. super
+        FNL_API auto FindProperty(FName name) const -> class FProperty*; // uncached walk incl. super
     };
 
     class UScriptStruct : public UStruct
@@ -250,9 +262,9 @@ namespace fue
         }
 
         // The value ops of 4.24's UProperty (its non-virtual wrappers over the Hype-shifted virtuals)
-        auto InitializeValue(void* dest) const -> void;
-        auto DestroyValue(void* dest) const -> void;
-        auto CopyCompleteValue(void* dest, const void* src) const -> void;
+        FNL_API auto InitializeValue(void* dest) const -> void;
+        FNL_API auto DestroyValue(void* dest) const -> void;
+        FNL_API auto CopyCompleteValue(void* dest, const void* src) const -> void;
         auto InitializeValue_InContainer(void* container) const -> void { InitializeValue(ContainerPtrToValuePtr(container)); }
         auto DestroyValue_InContainer(void* container) const -> void { DestroyValue(ContainerPtrToValuePtr(container)); }
     };
@@ -289,8 +301,8 @@ namespace fue
         auto GetInner() const -> FProperty* { return detail::at<FProperty*>(this, 0x70); }
     };
 
-    auto is_property(const UObject* field) -> bool;
-    auto class_is(const UObject* obj, const CharType* class_name) -> bool; // exact class name
+    FNL_API auto is_property(const UObject* field) -> bool;
+    FNL_API auto class_is(const UObject* obj, const CharType* class_name) -> bool; // exact class name
 
     template <typename T>
     inline auto CastField(FProperty* p) -> T*
@@ -327,13 +339,13 @@ namespace fue
     class FText
     {
       public:
-        FText();
-        explicit FText(const CharType* s);
+        FNL_API FText();
+        FNL_API explicit FText(const CharType* s);
         explicit FText(const StringType& s) : FText(s.c_str()) {}
         FText(const FText&) = delete;
         FText& operator=(const FText&) = delete;
-        ~FText();
-        auto ToString() const -> StringType;
+        FNL_API ~FText();
+        FNL_API auto ToString() const -> StringType;
 
       private:
         alignas(8) uint8 m_storage[0x18]{};
@@ -346,8 +358,8 @@ namespace fue
         int32 ObjectIndex = -1;
         int32 ObjectSerialNumber = 0;
         FWeakObjectPtr() = default;
-        explicit FWeakObjectPtr(const UObject* o);
-        auto Get() const -> UObject*;
+        FNL_API explicit FWeakObjectPtr(const UObject* o);
+        FNL_API auto Get() const -> UObject*;
     };
 
     // ------------------------------------------------------------------ script VM -----------------
@@ -373,7 +385,7 @@ namespace fue
         auto PreviousFrame() const -> FFrame* { return detail::at<FFrame*>(this, 0x70); }
         auto OutParms() const -> FOutParmRec* { return detail::at<FOutParmRec*>(this, 0x78); }
         auto CurrentNativeFunction() const -> UFunction* { return detail::at<UFunction*>(this, 0x88); }
-        auto Step(UObject* context, void* result) -> void; // GNatives[*Code++](context, *this, result)
+        FNL_API auto Step(UObject* context, void* result) -> void; // GNatives[*Code++](context, *this, result)
     };
 
     // ------------------------------------------------------------------ hooks ---------------------
@@ -405,29 +417,31 @@ namespace fue
         };
         using EngineTickCallback = std::function<void(TCallbackIterationData<void>&, UEngine*, float, bool)>;
         using ProcessEventCallback = std::function<void(TCallbackIterationData<void>&, UObject*, UFunction*, void*)>;
-        auto RegisterEngineTickPreCallback(EngineTickCallback cb, FCallbackOptions opts = {}) -> void;
-        auto RegisterProcessEventPreCallback(ProcessEventCallback cb, FCallbackOptions opts = {}) -> void;
-        auto RegisterProcessEventPostCallback(ProcessEventCallback cb, FCallbackOptions opts = {}) -> void;
+        FNL_API auto RegisterEngineTickPreCallback(EngineTickCallback cb, FCallbackOptions opts = {}) -> void;
+        FNL_API auto RegisterProcessEventPreCallback(ProcessEventCallback cb, FCallbackOptions opts = {}) -> void;
+        FNL_API auto RegisterProcessEventPostCallback(ProcessEventCallback cb, FCallbackOptions opts = {}) -> void;
     } // namespace Hook
 
     // ------------------------------------------------------------------ object globals ------------
     namespace UObjectGlobals
     {
-        auto StaticFindObject(UClass* cls, UObject* outer, const CharType* path) -> UObject*;
+        FNL_API auto StaticFindObject(UClass* cls, UObject* outer, const CharType* path) -> UObject*;
         template <typename T>
         auto StaticFindObject(UClass* cls, UObject* outer, const CharType* path) -> T
         {
             return static_cast<T>(StaticFindObject(cls, outer, path));
         }
-        auto FindAllOf(const CharType* class_name, std::vector<UObject*>& out) -> void;
-        auto StaticConstructObject(UClass* cls, UObject* outer, FName name, EObjectFlags flags, UObject* tmpl) -> UObject*;
+        // Every object whose class has this short name, except classes in the custom songs' folders
+        // (/Game/Audio/Songs/, /Game/DLC/Songs/, /Game/UI/AlbumArt/), which can't be the game's.
+        FNL_API auto FindAllOf(const CharType* class_name, std::vector<UObject*>& out) -> void;
+        FNL_API auto StaticConstructObject(UClass* cls, UObject* outer, FName name, EObjectFlags flags, UObject* tmpl) -> UObject*;
         template <typename T>
         auto NewObject(UObject* outer, UClass* cls, FName name = NAME_None, EObjectFlags flags = RF_NoFlags, UObject* tmpl = nullptr) -> T*
         {
             return static_cast<T*>(StaticConstructObject(cls, outer, name, flags, tmpl));
         }
         // A native UFunction hook: Func swapped to a generic thunk that runs pre, the original, then post.
-        auto RegisterHook(UFunction* fn, UnrealScriptFunctionCallable pre, UnrealScriptFunctionCallable post, void* data) -> std::pair<int, int>;
-        auto object_count() -> int32; // live GUObjectArray elements (diagnostics)
+        FNL_API auto RegisterHook(UFunction* fn, UnrealScriptFunctionCallable pre, UnrealScriptFunctionCallable post, void* data) -> std::pair<int, int>;
+        FNL_API auto object_count() -> int32; // live GUObjectArray elements (diagnostics)
     } // namespace UObjectGlobals
 } // namespace fue

@@ -29,7 +29,7 @@
 
 #include "custom_content.hpp"
 #include "data_table.hpp"
-#include "multiplayer/json_lite.hpp"
+#include "json_lite.hpp"
 #include "multiplayer/mp_shared.hpp"
 
 #include <algorithm>

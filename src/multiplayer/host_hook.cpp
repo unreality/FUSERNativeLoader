@@ -21,10 +21,11 @@
 #include "fue/fue.hpp"
 #include "custom_content.hpp"
 #include "multiplayer/community_fetch.hpp"
-#include "multiplayer/json_lite.hpp"
+#include "json_lite.hpp"
 #include "multiplayer/mp_shared.hpp"
 #include "multiplayer/p2p_tunnel.hpp"
 #include "multiplayer/pak_check.hpp"
+#include "unlocks.hpp"
 
 #include <funchook.h>
 #include "hook_range.hpp"
@@ -58,8 +59,6 @@
 #endif
 
 using namespace fue;
-
-auto unlocks_add_song_row(const CharType* name) -> uint8*; // unlocks.cpp (winhttp.dll)
 
 namespace
 {
@@ -2097,7 +2096,7 @@ namespace
     }
 
     // ---- Download Songs (No / Temporarily / Permanently) ---------------------------------------------------------
-    // The settings screen (native/fusernative.cpp) saves DownloadSongs=0/1/2 to FuserNative.ini; it is read here at
+    // The Mods tab's row (plugin_entry.cpp) saves DownloadSongs=0/1/2 to FuserNative.ini; it is read here at
     // most once a second, so a change applies mid-session. Without the key, the old StoreAutoInstall=0 reads as No;
     // the default is Permanently (Route B as before). It governs the songs this machine fetches because another
     // player's crate has them, the StoreTestInstall trigger, and owned Diamond Store songs restored at login; a
@@ -2139,6 +2138,30 @@ namespace
         const int parsed = _wtoi(ini_value(STR("DownloadMixSongs"), STR("1")).c_str());
         mode = parsed >= kDownloadNo && parsed <= kDownloadPermanently ? parsed : kDownloadTemporarily;
         return mode;
+    }
+
+    // P2P Song Download (P2PSongDownload=0/1/2, default From Followed): which players a crate song fuserd doesn't have
+    // is taken from. Off asks no one; From Followed asks only players this player follows; Always asks every player
+    // whose crate holds it. A song comes from that player's own files, so it is only as trustworthy as they are. A
+    // player this player has blocked is never asked. Read like DownloadSongs.
+    constexpr int kP2POff = 0, kP2PFollowed = 1, kP2PAlways = 2;
+    auto p2p_download_mode() -> int
+    {
+        static std::mutex mu;
+        static uint64 read_at = 0;
+        static int mode = kP2PFollowed;
+        std::lock_guard lock(mu);
+        const uint64 now = GetTickCount64();
+        if (read_at && now - read_at < 1000) return mode;
+        read_at = now;
+        const StringType v = ini_value(STR("P2PSongDownload"), STR(""));
+        const int parsed = v.empty() ? -1 : _wtoi(v.c_str());
+        mode = parsed >= kP2POff && parsed <= kP2PAlways ? parsed : kP2PFollowed;
+        return mode;
+    }
+    auto p2p_download_mode_name(int mode) -> const CharType*
+    {
+        return mode == kP2POff ? STR("Off") : mode == kP2PFollowed ? STR("From Followed") : STR("Always");
     }
 
     // Temporarily: %LOCALAPPDATA%\Fuser\Saved\FuserNative\SessionSongs\<pid>\, outside Content/Paks so the next
@@ -3595,6 +3618,13 @@ namespace
             Output::send<LogLevel::Normal>(STR("[songs] {}: not a custom song path; not asking other players\n"), path);
             return;
         }
+        if (p2p_download_mode() == kP2POff)
+        {
+            Output::send<LogLevel::Normal>(STR("[songs] {}: not in fuserd's catalogue; not asking other players (P2P Song Download is Off)\n"), path);
+            ++g_sync_failed;
+            crate_fetch_failed(path);
+            return;
+        }
         const FName name(path.c_str(), FNAME_Add);
         uint64 key = 0;
         std::memcpy(&key, &name, sizeof(key));
@@ -3629,6 +3659,12 @@ namespace
         std::string mapping, lan;
         std::map<std::string, SongXfer> xfers; // by transfer id
         std::set<std::string> finished;        // transfers already ended here; fuserd lists them for another minute
+        struct Relation
+        {
+            bool known = false, followed = false, blocked = false;
+            uint64 at = 0; // when it was asked for
+        };
+        std::map<int64, Relation> relations; // this player's view of other players (players/get/), by fuserd id
     };
 
     auto song_post(SongWorkerState& w, const CharType* path, const std::string& body, jsonl::Value* res, int* status = nullptr) -> bool
@@ -3656,6 +3692,38 @@ namespace
         if (error.starts_with("stalled")) return "stalled";
         if (error.starts_with("rejected")) return "rejected";
         return "failed";
+    }
+
+    // Worker thread: the owners a song may be asked of under P2P Song Download. fuserd's players/get/ gives this
+    // player's view of each (is_followed, is_blocked); an answer is kept for a minute, so a follow made in the lobby
+    // counts for the next request. When it can't be had (asked again after 10 s), the owner is left out under From
+    // Followed and kept under Always.
+    auto song_owners_allowed(SongWorkerState& w, const std::vector<int64>& owners, int mode) -> std::vector<int64>
+    {
+        std::vector<int64> out;
+        for (int64 id : owners)
+        {
+            SongWorkerState::Relation& rel = w.relations[id];
+            const uint64 now = GetTickCount64();
+            if (now - rel.at > (rel.known ? 60000u : 10000u))
+            {
+                jsonl::Value res;
+                StringType err;
+                rel.at = now;
+                rel.known = p2p_call(w.api, STR("players/get/"), std::format("{{\"user_id\":{}}}", id), &res, &err);
+                if (rel.known)
+                {
+                    rel.followed = res["is_followed"].boolean();
+                    rel.blocked = res["is_blocked"].boolean();
+                }
+                else
+                    Output::send<LogLevel::Warning>(STR("[songs] player {}: players/get/ failed ({}); not known whether followed\n"), id, err);
+            }
+            if (rel.known && rel.blocked) continue;
+            if (mode == kP2PFollowed && !(rel.known && rel.followed)) continue;
+            out.push_back(id);
+        }
+        return out;
     }
 
     // The requester's files are checked: move them where Download Songs says and start the install.
@@ -3740,8 +3808,9 @@ namespace
     {
         SongWorkerState w{api, gsid, {}, {}, {}, {}};
         g_song_worker_gen.store(gen);
-        Output::send<LogLevel::Normal>(STR("[songs] session {}: song transfers on (Send Songs {}, Download Songs {})\n"), gsid,
-                                       ini_value(STR("SendSongs"), STR("0")) == STR("1") ? STR("Yes") : STR("No"), download_mode_name(download_mode()));
+        Output::send<LogLevel::Normal>(STR("[songs] session {}: song transfers on (Send Songs {}, Download Songs {}, P2P Song Download {})\n"), gsid,
+                                       ini_value(STR("SendSongs"), STR("0")) == STR("1") ? STR("Yes") : STR("No"), download_mode_name(download_mode()),
+                                       p2p_download_mode_name(p2p_download_mode()));
         const auto gather = [&] {
             std::vector<p2p::Candidate> cands;
             std::string mapping;
@@ -3782,6 +3851,28 @@ namespace
             for (size_t i = 0; i < batch.size(); ++i)
             {
                 SongRequest& r = batch[i];
+                // P2P Song Download, again: it may have changed since the song was queued
+                const int p2p_mode = p2p_download_mode();
+                if (p2p_mode == kP2POff)
+                {
+                    Output::send<LogLevel::Normal>(STR("[songs] {}: not asking other players (P2P Song Download is Off)\n"), widen(r.path));
+                    song_request_failed(r.path);
+                    continue;
+                }
+                const size_t holders = r.owners.size();
+                r.owners = song_owners_allowed(w, r.owners, p2p_mode);
+                if (r.owners.empty())
+                {
+                    Output::send<LogLevel::Normal>(STR("[songs] {}: not asking other players: {} (P2P Song Download is {})\n"), widen(r.path),
+                                                   p2p_mode == kP2PFollowed ? std::format(STR("none of the {} player(s) who have it is followed (blocked players are never asked)"), holders)
+                                                                            : std::format(STR("all {} player(s) who have it are blocked"), holders),
+                                                   p2p_download_mode_name(p2p_mode));
+                    song_request_failed(r.path);
+                    continue;
+                }
+                if (r.owners.size() < holders)
+                    Output::send<LogLevel::Normal>(STR("[songs] {}: asking {} of the {} player(s) who have it (P2P Song Download is {})\n"), widen(r.path), r.owners.size(),
+                                                   holders, p2p_download_mode_name(p2p_mode));
                 std::string list;
                 for (int64 o : r.owners) list += (list.empty() ? "" : ",") + std::to_string(o);
                 jsonl::Value res;
