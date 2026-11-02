@@ -234,7 +234,11 @@ auto pak_diag_start() -> void
     g_exe = reinterpret_cast<uint8*>(GetModuleHandleW(nullptr));
     install_handler_hooks();
     Hook::RegisterEngineTickPreCallback([](Hook::TCallbackIterationData<void>&, UEngine*, float, bool) {
-        if (!g_running.exchange(true)) g_game_thread = GetCurrentThreadId();
+        if (!g_running.exchange(true))
+        {
+            g_game_thread = GetCurrentThreadId();
+            Output::send<LogLevel::Normal>(STR("[pak] first engine tick on thread {}\n"), g_game_thread.load());
+        }
         watch_dlc_scan();
     });
 }

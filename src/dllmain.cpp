@@ -1,7 +1,9 @@
 bool fnl_start(void* self_module); // fnl_entry.cpp: the fue core and the FuserNative features (C++20)
+void fnl_log(int level, const wchar_t* text); // fnl_entry.cpp: a line in FuserNative.log
 void pak_diag_opened(const wchar_t* file_name, bool is_signed); // pak_diag.cpp: paks opened once the game runs
 
 #include <cstdio>
+#include <cwchar>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -11,6 +13,9 @@ namespace fs = std::filesystem;
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <Psapi.h>
+#include <intrin.h>
+
+#pragma intrinsic(_ReturnAddress)
 
 // Extended proxy APIs used by the supplied Windows 10 WinHTTP's internal proxy
 // resolver. The definitions use the SDK signatures in a separate translation unit.
@@ -147,7 +152,12 @@ extern "C" {
 }
 
 HMODULE mHinstDLL = 0;
-bool hooked = false;
+
+// Startup (loader_start) runs once
+static HMODULE g_self = nullptr;
+static volatile LONG g_start_claimed = 0;
+static volatile LONG g_start_finished = 0;
+static volatile LONG g_paks_during_start = 0; // paks the signature bypass saw opened before startup finished
 
 // Loads the original DLL from the default system directory
 //	Function originally written by Michael Koch
@@ -200,6 +210,7 @@ static thread_local ThreadData PAK_THREAD_DATA;
 
 
 void* FPakFile_Ctor_Hook(void *ths, void *LowerLevel, const wchar_t *FileName, bool bIsSigned, bool bLoadIndex) {
+	if (!g_start_finished) InterlockedIncrement(&g_paks_during_start);
 	auto &&data = PAK_THREAD_DATA;
 	data.do_unsigned = wcsstr(FileName, L"_P") != nullptr;
 
@@ -450,41 +461,101 @@ static void DisableLegacyUnlockPak(HMODULE self) {
 	}
 }
 
+#if FNL_DEBUG
+// A startup test's setting from the environment; 0 when it isn't set
+static DWORD debug_env(const wchar_t* name) {
+	wchar_t value[16]{};
+	return GetEnvironmentVariableW(name, value, 16) ? wcstoul(value, nullptr, 10) : 0;
+}
+#endif
+
+// The signature bypass, the fue core, the mods' manifests and early stage, the runtime unlocks and the features
+static void loader_start(bool before_winmain) {
+//To Enable Console
+#if FNL_DEBUG
+	//Use existing console, or create one if needed
+	if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
+		AllocConsole();
+		ShowWindow(GetConsoleWindow(), SW_SHOW);
+	}
+
+	//Redirect output to console
+	FILE* fp;
+	freopen_s(&fp, "CONOIN$", "r", stdin);
+	freopen_s(&fp, "CONOUT$", "w", stdout);
+	freopen_s(&fp, "CONOUT$", "w", stderr);
+
+#endif
+	wchar_t line[160];
+	swprintf_s(line, before_winmain ? L"[fnl] startup on the main thread (%lu), before WinMain\n"
+	                                : L"[fnl] startup on the first new thread (%lu): the engine may mount paks before it finishes\n", GetCurrentThreadId());
+	fnl_log(before_winmain ? FNL_LOG_NORMAL : FNL_LOG_WARNING, line);
+
+	DisableLegacyUnlockPak(g_self);
+	FUSER_HOOK();
+#if FNL_DEBUG
+	// Stands in for slow early mods, after the signature bypass so its pak count sees what the delay lets through
+	if (const DWORD delay = debug_env(L"FNL_TEST_STARTUP_DELAY_MS")) Sleep(delay);
+#endif
+	fnl_start(g_self);
+
+	InterlockedExchange(&g_start_finished, 1);
+	const LONG paks = g_paks_during_start;
+	swprintf_s(line, L"[fnl] startup finished on thread %lu, %ld pak(s) opened while it ran\n", GetCurrentThreadId(), paks);
+	fnl_log(paks ? FNL_LOG_WARNING : FNL_LOG_NORMAL, line);
+}
+
+static bool claim_start() {
+	return InterlockedExchange(&g_start_claimed, 1) == 0;
+}
+
+// The CRT calls this import once, on the main thread, right before WinMain. That thread is the one that later mounts
+// the startup paks (WinMain -> PreInit -> FPakPlatformFile::Initialize), so startup finishes before any of them, however
+// long it takes. The exe's code is decrypted by then, even under the Steam stub, whose import table is readable from
+// DLL_PROCESS_ATTACH on. Only a caller in .text starts it: that code can't run before it is decrypted.
+using WinMainCmdLineFn = char* (__cdecl*)();
+static const char kCrtRuntime[] = "api-ms-win-crt-runtime";
+static const char kWinMainCmdLine[] = "_get_narrow_winmain_command_line";
+static WinMainCmdLineFn g_winmain_cmdline = nullptr;
+static void** g_start_slot = nullptr;
+
+static char* __cdecl WinMainCmdLine_Hook() {
+	if (!g_start_claimed && code_in_exe_text(_ReturnAddress()) && claim_start()) loader_start(true);
+	return g_winmain_cmdline();
+}
+
+static void install_start_redirect() {
+#if FNL_DEBUG
+	if (debug_env(L"FNL_TEST_NO_START_REDIRECT")) return; // tests the first-thread fallback
+#endif
+	void* original = nullptr;
+	if (!code_redirect_import("loader", kCrtRuntime, kWinMainCmdLine, reinterpret_cast<void*>(&WinMainCmdLine_Hook), &original)) return;
+	HMODULE owner = nullptr;
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(original), &owner)) {
+		// Not bound to a function yet: the OS loader would overwrite the redirect
+		void* ours = nullptr;
+		code_redirect_import("loader", kCrtRuntime, kWinMainCmdLine, original, &ours);
+		fnl_log(FNL_LOG_WARNING, L"[fnl] the WinMain command line import isn't bound yet - startup falls back to the first new thread\n");
+		return;
+	}
+	g_winmain_cmdline = reinterpret_cast<WinMainCmdLineFn>(original);
+	g_start_slot = code_import_slot(kCrtRuntime, kWinMainCmdLine);
+}
+
 BOOL WINAPI DllMain(HMODULE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 	if (fdwReason == DLL_PROCESS_ATTACH) {
+		g_self = hinstDLL;
 		load_original_dll();
 		loadFunctions(mHinstDLL);
+		install_start_redirect();
 	}
 	else if (fdwReason == DLL_PROCESS_DETACH) {
 		FreeLibrary(mHinstDLL);
 	}
-	
-	if (hooked) {
-		return (TRUE);
-	}
-	
-	if (fdwReason == DLL_THREAD_ATTACH) {
-		hooked = true;
-		
-//To Enable Console
-#if FNL_DEBUG
-		//Use existing console, or create one if needed
-		if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
-			AllocConsole();
-			ShowWindow(GetConsoleWindow(), SW_SHOW);
-		}
-	
-		//Redirect output to console
-		FILE* fp;
-		freopen_s(&fp, "CONOIN$", "r", stdin);
-		freopen_s(&fp, "CONOUT$", "w", stdout);
-		freopen_s(&fp, "CONOUT$", "w", stderr);
-		
-#endif
-		DisableLegacyUnlockPak(hinstDLL);
-		FUSER_HOOK();
-		// the UE 4.24 reflection core (fue), the runtime unlocks and the FuserNative features
-		fnl_start(hinstDLL);
+	// The first new thread starts the loader only when the redirect isn't there to do it: never installed, or overwritten
+	else if (fdwReason == DLL_THREAD_ATTACH && !g_start_claimed) {
+		const bool redirected = g_start_slot && *g_start_slot == reinterpret_cast<void*>(&WinMainCmdLine_Hook);
+		if (!redirected && claim_start()) loader_start(false);
 	}
 
 	return (TRUE);

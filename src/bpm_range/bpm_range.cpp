@@ -1,5 +1,5 @@
 // FUSERBpmRange: the game's BPM range widened from 90-157 to 60-200. An early-stage mod on the C tier (mod.ini beside
-// it): the bytes are patched inside the loader's DllMain, before the game runs, as the loader itself did.
+// it): the bytes are patched before WinMain, before the game runs, as the loader itself did.
 //
 // GetMaxBpm / GetMinBpm return immediates (157 / 90), and the two functions that clamp the current and a song's BPM
 // compare and load the same bounds a few bytes into their bodies. Each build's sites are checked byte for byte; on an

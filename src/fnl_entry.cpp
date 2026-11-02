@@ -125,6 +125,12 @@ auto unlocks_start() -> void;     // unlocks.cpp
 auto custom_content_start() -> void; // custom_content.cpp
 auto unlock_probe_start() -> void; // unlock_probe.cpp (debug builds)
 
+// A line in FuserNative.log, for dllmain.cpp (C++17, without fue). level: FNL_LOG_*.
+void fnl_log(int level, const wchar_t* text)
+{
+    Output::write(static_cast<LogLevel>(level), text);
+}
+
 // The loader's entry (dllmain.cpp, after FUSER_HOOK): the fue core, the mods' manifests and early stage, the Mods tab,
 // the unlocks and custom content. The game features are mods, loaded at the first engine callback (fue); the probe
 // (F9) is debug-only.

@@ -47,9 +47,12 @@ Lists are comma-separated; `;` or `#` starts a comment. Mods load in dependency 
 
 - **game** (the default): `fnl_mod_init` runs at the first ProcessEvent / GameEngine::Tick, before the unreal-init
   callbacks. Needs a game build the loader knows.
-- **early**: inside the loader's DllMain, before any pak is mounted; for engine-level fixes that must be in place
-  before the game starts (a pak list fix, say). C tier only. The DLL's own DllMain must do nothing, it may import
-  only system DLLs and the `/MD` CRT, and it must not wait on other threads.
+- **early**: on the game's main thread, after its static initialisers and before `WinMain`, so before any pak is
+  mounted, however long the early mods take; for engine-level fixes that must be in place before the game starts (a
+  pak list fix, say). C tier only. The engine isn't set up yet: use `GetCommandLineW` rather than `FCommandLine`, and
+  `mod_dir` rather than the working directory. If the loader can't start there, it starts on the first new thread
+  instead, inside its DllMain, where paks may be mounting already (`FuserNative.log` warns). So the DLL's own DllMain
+  must do nothing, it may import only system DLLs and the `/MD` CRT, and it must not wait on other threads.
 
 `fnl_mod_init(const FnlApi* api, FnlMod* self)` returns `FNL_OK`, `FNL_UNSUPPORTED` (nothing to do on this build) or
 `FNL_FAILED`. Check `api->abi` and `FNL_API_HAS(api, field)` for anything newer than the loader you built against.

@@ -503,30 +503,58 @@ bool code_patch(const char* owner, void* at, const void* bytes, size_t count, bo
     return true;
 }
 
+namespace
+{
+    // The exe's import slot of function, with the importing DLL's name in *from; nullptr when it isn't imported
+    auto find_import(const char* dll, const char* function, const char** from) -> void**
+    {
+        uint8_t* exe = code_exe_base();
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(exe + reinterpret_cast<const IMAGE_DOS_HEADER*>(exe)->e_lfanew);
+        const IMAGE_DATA_DIRECTORY& imports = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        for (auto* d = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(exe + imports.VirtualAddress); imports.VirtualAddress && d->Name; ++d)
+        {
+            const char* name = reinterpret_cast<const char*>(exe + d->Name);
+            if ((dll && _strnicmp(name, dll, std::strlen(dll)) != 0) || !d->OriginalFirstThunk) continue;
+            auto* names = reinterpret_cast<const IMAGE_THUNK_DATA*>(exe + d->OriginalFirstThunk);
+            auto* slots = reinterpret_cast<IMAGE_THUNK_DATA*>(exe + d->FirstThunk);
+            for (; names->u1.AddressOfData; ++names, ++slots)
+            {
+                if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
+                const auto* by_name = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(exe + names->u1.AddressOfData);
+                if (std::strcmp(reinterpret_cast<const char*>(by_name->Name), function) != 0) continue;
+                if (from) *from = name;
+                return reinterpret_cast<void**>(&slots->u1.Function);
+            }
+        }
+        return nullptr;
+    }
+} // namespace
+
+void** code_import_slot(const char* dll, const char* function)
+{
+    return function ? find_import(dll, function, nullptr) : nullptr;
+}
+
+bool code_in_exe_text(const void* p)
+{
+    uint8_t* exe = code_exe_base();
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(exe + reinterpret_cast<const IMAGE_DOS_HEADER*>(exe)->e_lfanew);
+    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+    const auto a = reinterpret_cast<uintptr_t>(p);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section)
+    {
+        if (std::memcmp(section->Name, ".text\0\0\0", IMAGE_SIZEOF_SHORT_NAME) != 0) continue;
+        const uintptr_t start = reinterpret_cast<uintptr_t>(exe) + section->VirtualAddress;
+        return a >= start && a < start + section->Misc.VirtualSize;
+    }
+    return false;
+}
+
 bool code_redirect_import(const char* owner, const char* dll, const char* function, void* replacement, void** original)
 {
     if (!owner || !function || !replacement || !original) return false;
-    uint8_t* exe = code_exe_base();
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(exe + reinterpret_cast<const IMAGE_DOS_HEADER*>(exe)->e_lfanew);
-    const IMAGE_DATA_DIRECTORY& imports = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    void** slot = nullptr;
     const char* from = nullptr;
-    for (auto* d = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(exe + imports.VirtualAddress); imports.VirtualAddress && d->Name && !slot; ++d)
-    {
-        const char* name = reinterpret_cast<const char*>(exe + d->Name);
-        if ((dll && _strnicmp(name, dll, std::strlen(dll)) != 0) || !d->OriginalFirstThunk) continue;
-        auto* names = reinterpret_cast<const IMAGE_THUNK_DATA*>(exe + d->OriginalFirstThunk);
-        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA*>(exe + d->FirstThunk);
-        for (; names->u1.AddressOfData; ++names, ++slots)
-        {
-            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
-            const auto* by_name = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(exe + names->u1.AddressOfData);
-            if (std::strcmp(reinterpret_cast<const char*>(by_name->Name), function) != 0) continue;
-            slot = reinterpret_cast<void**>(&slots->u1.Function);
-            from = name;
-            break;
-        }
-    }
+    void** slot = find_import(dll, function, &from);
     const StringType what = std::format(STR("import {}!{}"), to_wstring(from ? from : dll ? dll : "*"), to_wstring(function));
     if (!slot)
     {

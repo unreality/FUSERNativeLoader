@@ -459,7 +459,7 @@ namespace
             for (auto& [m, deps] : waits) deps.erase(next);
         }
         for (auto& [m, deps] : waits) m->problem = STR("its requires= / after= / before= form a cycle");
-        // early mods first: they load inside DllMain, the rest at the first engine callback
+        // early mods first: they load at the loader's startup, the rest at the first engine callback
         std::stable_partition(g_order.begin(), g_order.end(), [](FnlMod* m) { return m->early; });
     }
 

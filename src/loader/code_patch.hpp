@@ -48,3 +48,9 @@ bool code_patch(const char* owner, void* at, const void* bytes, size_t count, bo
 
 // The game exe's import slot of function redirected (FnlApi::redirect_import).
 bool code_redirect_import(const char* owner, const char* dll, const char* function, void* replacement, void** original);
+
+// The game exe's import slot of function; nullptr when it isn't imported. dll as for code_redirect_import.
+void** code_import_slot(const char* dll, const char* function);
+
+// Whether p lies in the game exe's .text section.
+bool code_in_exe_text(const void* p);

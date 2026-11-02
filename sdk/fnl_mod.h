@@ -6,8 +6,11 @@
 //     FNL_MOD_EXPORT int fnl_mod_init(const FnlApi* api, FnlMod* self);
 //
 // which the loader calls once, at the mod's stage:
-//   - early: inside the loader's DllMain (DLL_THREAD_ATTACH), before any pak is mounted. The mod's own DllMain must do
-//     nothing, it may import only system DLLs and the /MD CRT, and it must not wait on other threads;
+//   - early: on the game's main thread, after its static initialisers and before WinMain, so before any pak is mounted.
+//     The engine isn't set up: use GetCommandLineW rather than FCommandLine, and mod_dir rather than the working
+//     directory. If the loader can't start there it starts on the first new thread instead, inside DllMain, where paks
+//     may be mounting already (the log warns). So the mod's own DllMain must do nothing, it may import only system DLLs
+//     and the /MD CRT, and it must not wait on other threads;
 //   - game: at the first ProcessEvent or GameEngine::Tick, before the unreal-init callbacks. Needs a game build the
 //     loader knows.
 // It returns FNL_OK, FNL_UNSUPPORTED (nothing to do here, e.g. an unknown build) or FNL_FAILED.

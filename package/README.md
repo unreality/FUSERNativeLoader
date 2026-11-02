@@ -35,6 +35,38 @@ If an earlier FuserNative build is installed, delete its mod pak from `Fuser/Con
 Settings are saved in `Fuser/Binaries/Win64/FuserNative.ini`; a log is written to
 `Fuser/Binaries/Win64/FuserNative.log`.
 
+The directory layout should look similar to this when installed:
+
+FUSER/
+├Engine/
+└Fuser/
+ ├── Binaries/
+ │   └── Win64/
+ │       ├── winhttp.dll                          
+ │       └── mods/
+ │           ├── FUSERBpmRange/
+ │           │   ├── FUSERBpmRange.dll               
+ │           │   └── mod.ini
+ │           ├── FUSERFifthDeck/
+ │           │   ├── FUSERFifthDeck.dll                    
+ │           │   └── mod.ini
+ │           ├── FUSERFixes/
+ │           │   ├── FUSERFixes.dll                       
+ │           │   └── mod.ini
+ │           ├── FUSERMultiplayer/
+ │           │   ├── FUSERMultiplayer.dll                  
+ │           │   └── mod.ini
+ │           └── FUSERQualityOfLifeImprovements/
+ │               ├── FUSERQualityOfLifeImprovements.dll    
+ │               └── mod.ini
+ └── Content/
+     └── Paks/
+         └── mods/
+             ├── FUSERFifthDeck_P.pak                      
+             ├── FUSERFifthDeck_P.sig
+             ├── FUSERQualityOfLifeImprovements_P.pak
+             └── FUSERQualityOfLifeImprovements_P.sig
+
 ## Components
 
 ### The loader - `winhttp.dll`

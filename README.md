@@ -62,7 +62,7 @@ Server content (fuserd's items, kept by the multiplayer DLL) lives in `Fuser\Con
 
 `winhttp.dll` loads the mods in `Fuser\Binaries\Win64\mods\<Name>\`, each described by a `mod.ini` (keys in
 `src/loader/mod_manager.cpp`) and built against `sdk/fnl_mod.h`. A mod's `fnl_mod_init` runs at its stage: `early`
-(inside the loader's DllMain, before any pak is mounted) or `game` (the first engine callback, before the unreal-init
+(on the main thread just before `WinMain`, so before any pak is mounted) or `game` (the first engine callback, before the unreal-init
 callbacks). It gets the loader's logging, pattern search, hooks, code patches, import redirects, engine events and
 `FuserNative.ini` values; code it changes through them is recorded, so every pattern search still sees the game as
 shipped. A mod built on fue (the C++ tier, `sdk=` in its `mod.ini`) must match the loader's `FNL_SDK_VERSION`.

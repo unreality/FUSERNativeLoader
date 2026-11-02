@@ -2,7 +2,7 @@
 // The mod manager (mod_manager.cpp): the mods in mods/<folder>/, each described by its mod.ini, and the FnlApi table
 // (sdk/fnl_mod.h) they get.
 
-// fnl_start, inside DllMain before any pak is mounted: every mod.ini read, the load order resolved, supersedes=
+// fnl_start, at the loader's startup before any pak is mounted: every mod.ini read, the load order resolved, supersedes=
 // applied, then the early mods loaded. fue_ok: fue::init succeeded (a known build); without it no game stage follows.
 auto fnl_mods_early(bool fue_ok) -> void;
 
