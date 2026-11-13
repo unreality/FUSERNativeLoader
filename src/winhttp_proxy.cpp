@@ -22,8 +22,13 @@ void load_extended_winhttp_functions(HMODULE dll)
     g_free_proxy_result_ex = reinterpret_cast<decltype(g_free_proxy_result_ex)>(GetProcAddress(dll, "WinHttpFreeProxyResultEx"));
 }
 
-// CMake's WINDOWS_EXPORT_ALL_SYMBOLS exports these C names; leaving the
-// declarations undecorated also matches the SDK's non-import declarations.
+// Exported by name here: the target has no export-all setting, and System32's
+// winhttp.dll can load this proxy by its basename and look these three up. The
+// definitions stay undecorated to match the SDK's non-import declarations.
+#pragma comment(linker, "/EXPORT:WinHttpGetProxyForUrlEx2")
+#pragma comment(linker, "/EXPORT:WinHttpGetProxyResultEx")
+#pragma comment(linker, "/EXPORT:WinHttpFreeProxyResultEx")
+
 extern "C" DWORD WINAPI WinHttpGetProxyForUrlEx2(
     HINTERNET resolver, PCWSTR url, WINHTTP_AUTOPROXY_OPTIONS* options,
     DWORD selection_size, BYTE* selection, DWORD_PTR context)
